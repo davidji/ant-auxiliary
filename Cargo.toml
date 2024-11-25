@@ -1,0 +1,31 @@
+[package]
+authors = ["David Ireland <davidji@pobox.com>"]
+edition = "2018"
+name = "ant-auxiliary"
+version = "0.1.0"
+
+[dependencies]
+embedded-hal = { version = "1.0.0" }
+embedded-hal-nb = { version = "1.0.0" }
+stm32f1xx-hal = { git = "https://github.com/davidji/stm32f1xx-hal.git", branch="master",  features = [ "stm32-usbd", "stm32f103", "medium" ] }
+stm32-usbd = { version = "0.7.0" }
+cortex-m = "0.7.2"
+cortex-m-semihosting = "0.5.0"
+panic-semihosting = "0.6.0"
+cortex-m-rtic = "1.1.4"
+nb = "1.1.0"
+heapless = "0.8.0"
+am2320 = { git = "https://github.com/davidji/am2320.rs.git", tag="0.3.0-rc.1" }
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
+ads1x1x = "0.2.1"
+postcard = "1.0.10"
+arraydeque = { version = "0.5.1", default-features = false }
+serde = { version = "1.0.215", default-features = false }
+cobs = { version = "0.2.3", default-features = false }
+
+# this lets you use `cargo fix`!
+[[bin]]
+name = "ant-auxiliary"
+test = false
+bench = false
