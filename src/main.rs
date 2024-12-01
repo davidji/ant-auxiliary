@@ -146,6 +146,14 @@ mod app {
 
     #[task(binds = USB_HP_CAN_TX, shared = [usb_dev, usb_serial])]
     fn usb_hp(cx: usb_hp::Context) {
+        // There's a lot of duplicated code in the two interrupt handlers and
+        // the usb_poll task, but we _must_ poll the usb device in the interrupt
+        // handler, in order to clear the interrupt. If you could somehow
+        // unbundle that, things would be a lot better.
+        // It's also not completely obvious this is safe: I don't think the
+        // lock is un-interruptable, so maybe another interrup starts
+        // while the local is still held, and we end up in a deadlock.
+        // This doesn't seem to ever happen though.
         let dev = cx.shared.usb_dev;
         let serial = cx.shared.usb_serial;
         if (dev, serial).lock(|dev,serial| {
