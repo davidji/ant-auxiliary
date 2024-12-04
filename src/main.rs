@@ -16,11 +16,12 @@ use stm32f1xx_hal::{
     usb::{Peripheral, UsbBus, UsbBusType}
 };
 use usb_device::prelude::*;
-use usbd_serial::embedded_io::{ReadReady, WriteReady};
+use usbd_serial::embedded_io::ReadReady;
 use rtic_sync::{
     channel::*,
     make_channel
 };
+use nb::Error::WouldBlock;
 use rtic_monotonics::systick::prelude::*;
 systick_monotonic!(Mono, 1_000);
 
@@ -33,19 +34,20 @@ type SerialChannelReceiver = Receiver<'static, u8, SERIAL_CHANNEL_CAPACITY>;
 
 #[rtic::app(device = stm32f1xx_hal::pac, dispatchers = [SPI3, UART4, UART5, TIM6, TIM7])]
 mod app {
+
     use super::*;
 
     #[shared]
     struct Shared {
         usb_dev: UsbDevice<'static, UsbBusType>,
         usb_serial: usbd_serial::SerialPort<'static, UsbBusType>,
+        grbl_tx_sender: SerialChannelSender,
     }
 
     #[local]
     struct Local {
         grbl_tx: GrblTx, 
         grbl_rx: GrblRx,
-        grbl_tx_sender: SerialChannelSender,
         grbl_tx_receiver: SerialChannelReceiver,
         grbl_rx_sender: SerialChannelSender,
         grbl_rx_receiver: SerialChannelReceiver,
@@ -88,12 +90,11 @@ mod app {
             pin_dp: usb_dp.into_floating_input(&mut gpioa.crh),
         }));
     
-
-
+        
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
         let usb_serial = usbd_serial::SerialPort::new(usb_bus);
 
-        let (grbl_tx, grbl_rx) = grbl_serial(
+        let (grbl_tx, mut grbl_rx) = grbl_serial(
             peripherals.USART1, 
             gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh), 
             gpioa.pa10, 
@@ -115,19 +116,18 @@ mod app {
         Mono::start(cx.core.SYST, 72_000_000);
 
         blink::spawn().unwrap();
-        usb_poll::spawn().unwrap();
-        grbl_serial_poll::spawn().unwrap();
-
-    
+        grbl_serial_tx::spawn().unwrap();
+        usb_tx::spawn().unwrap();
+        grbl_rx.listen();
 
         (Shared {
             usb_dev : grbl_usb_device(usb_bus), 
             usb_serial,
+            grbl_tx_sender,
          }, 
         Local {
             grbl_tx,
             grbl_rx,
-            grbl_tx_sender,
             grbl_tx_receiver,
             grbl_rx_sender,
             grbl_rx_receiver,
@@ -144,95 +144,87 @@ mod app {
         }
     }
 
-    #[task(binds = USB_HP_CAN_TX, shared = [usb_dev, usb_serial])]
+    #[task(binds = USB_HP_CAN_TX, shared = [usb_dev, usb_serial, grbl_tx_sender])]
     fn usb_hp(cx: usb_hp::Context) {
-        // There's a lot of duplicated code in the two interrupt handlers and
-        // the usb_poll task, but we _must_ poll the usb device in the interrupt
+        // There's a lot of duplicated code in the two interrupt handlers
+        // but we _must_ poll the usb device in the interrupt
         // handler, in order to clear the interrupt. If you could somehow
         // unbundle that, things would be a lot better.
         // It's also not completely obvious this is safe: I don't think the
-        // lock is un-interruptable, so maybe another interrup starts
+        // lock is un-interruptable, so maybe another interrupt starts
         // while the local is still held, and we end up in a deadlock.
         // This doesn't seem to ever happen though.
         let dev = cx.shared.usb_dev;
         let serial = cx.shared.usb_serial;
-        if (dev, serial).lock(|dev,serial| {
-            dev.poll(&mut [serial]) 
-        }) {
-            // Just ignore the error: it's because the task is already running
-           _ = usb::spawn();
-        }
-    }
-
-    #[task(binds = USB_LP_CAN_RX0, shared = [usb_dev, usb_serial])]
-    fn usb_lp(cx: usb_lp::Context) {
-        let dev = cx.shared.usb_dev;
-        let serial = cx.shared.usb_serial;
-        if (dev, serial).lock(|dev,serial| {
-            dev.poll(&mut [serial]) 
-        }) {
-            // Just ignore the error: it's because the task is already running
-           _ = usb::spawn();
-        }
-    }
-
-    #[task]
-    async fn usb_poll(_: usb_poll::Context) {
-        loop {
-            Mono::delay(1.millis()).await;
-            _ = usb::spawn();
-        }
-    }
-
-    #[task(shared = [usb_dev, usb_serial], local = [ grbl_tx_sender, grbl_rx_receiver], priority = 3)]
-    async fn usb(cx: usb::Context) {
-        let dev = cx.shared.usb_dev;
-        let serial = cx.shared.usb_serial;
-        let tx_sender = cx.local.grbl_tx_sender;
-        let rx_receiver = cx.local.grbl_rx_receiver;
-        (dev, serial).lock(|dev,serial| {
-            while dev.poll(&mut [serial]) {
-                usb_serial_io(serial, tx_sender, rx_receiver);
+        let sender = cx.shared.grbl_tx_sender;
+        (dev, serial, sender).lock(|dev, serial, sender| {
+            if dev.poll(&mut [serial]) {
+                usb_serial_io(serial, sender);
             }
         });
     }
 
-    #[task(binds = USART1)] 
-    fn grbl_serial_interrupt(_: grbl_serial_interrupt::Context) {
-        _ = grbl_serial_rx::spawn();
-        _ = grbl_serial_tx::spawn();
-    }
- 
-    #[task]
-    async fn grbl_serial_poll(_: grbl_serial_poll::Context) {
-        loop {
-            Mono::delay(10.millis()).await;
-            _ = grbl_serial_rx::spawn();
-            _ = grbl_serial_tx::spawn();
-        }
+    #[task(binds = USB_LP_CAN_RX0, shared = [usb_dev, usb_serial, grbl_tx_sender])]
+    fn usb_lp(cx: usb_lp::Context) {
+        let dev = cx.shared.usb_dev;
+        let serial = cx.shared.usb_serial;
+        let sender = cx.shared.grbl_tx_sender;
+        (dev, serial, sender).lock(|dev, serial, sender| {
+            if dev.poll(&mut [serial]) {
+                usb_serial_io(serial, sender);
+            }
+        });
     }
 
-    #[task(local=[grbl_rx, grbl_rx_sender], priority=2)]
-    async fn grbl_serial_rx(cx: grbl_serial_rx::Context) {
-        let grbl_rx = cx.local.grbl_rx;
+    #[task(shared = [usb_dev, usb_serial], local = [grbl_rx_receiver])]
+    async fn usb_tx(cx: usb_tx::Context) {
+        let mut shared = (cx.shared.usb_dev, cx.shared.usb_serial);
         loop {
-            match grbl_rx.read() {
-                Ok(data) => cx.local.grbl_rx_sender.send(data).await.unwrap(),
-                Err(nb::Error::WouldBlock) => break,
-                Err(_) => panic!("Error reading from GRBL serial")
+            match cx.local.grbl_rx_receiver.recv().await {
+                Ok(data) => 
+                    while ! shared.lock(|dev, serial| {
+                        match serial.write(&[data]) {
+                            Ok(_) => true,
+                            Err(UsbError::WouldBlock) => { dev.poll(&mut [serial]); false },
+                            Err(_) => panic!("Error writing to GRBL serial")
+                        }
+                    }) {
+                        Mono::delay(5.millis()).await;
+                    },
+                Err(_) => Mono::delay(5.millis()).await
             }
         }
     }
 
-    #[task(local=[grbl_tx, grbl_tx_receiver], priority=2)]
-    async fn grbl_serial_tx(cx: grbl_serial_tx::Context) {
-        let grbl_tx = cx.local.grbl_tx;
-        while grbl_tx.is_tx_empty() {
-            let data = cx.local.grbl_tx_receiver.recv().await.unwrap();
-            grbl_tx.write(data).unwrap();
+    #[task(binds = USART1, local=[grbl_rx, grbl_rx_sender])] 
+    fn grbl_serial_interrupt(cx: grbl_serial_interrupt::Context) {
+        let grbl_rx = cx.local.grbl_rx;
+        while grbl_rx.is_rx_not_empty() {
+            match grbl_rx.read() {
+                Ok(data) => cx.local.grbl_rx_sender.try_send(data).unwrap(),
+                Err(_) => panic!("Error reading from GRBL serial")
+            }
         }
+        
     }
 
+    #[task(local = [ grbl_tx, grbl_tx_receiver])]
+    async fn grbl_serial_tx(cx: grbl_serial_tx::Context) {
+        let grbl_tx = cx.local.grbl_tx;
+        loop {
+            match cx.local.grbl_tx_receiver.recv().await {
+                Ok(data) => loop {
+                    match grbl_tx.write(data) {
+                        Ok(_) => break,
+                        Err(WouldBlock) => Mono::delay(5.millis()).await,
+                        Err(_) => panic!("Error writing to GRBL serial")
+                    }
+                },
+                Err(_) => Mono::delay(5.millis()).await
+            };
+        }
+    }
+ 
     #[task(local=[fan_pwm])]
     async fn set_fan_speed(cx: set_fan_speed::Context, duty: u16) {
         cx.local.fan_pwm.set_duty(Channel::C1, duty);
@@ -274,8 +266,7 @@ fn grbl_serial(
 
 fn usb_serial_io(
     serial: &mut usbd_serial::SerialPort<'static, UsbBusType>, 
-    sender: &mut SerialChannelSender, 
-    receiver: &mut SerialChannelReceiver) {
+    sender: &mut SerialChannelSender) {
         
     while serial.read_ready().unwrap() && !sender.is_full() {
          let mut buf = [0u8; 1];
@@ -286,11 +277,4 @@ fn usb_serial_io(
         };
     }
 
-    while serial.write_ready().unwrap() {
-        match receiver.try_recv() {
-            Ok(data) => assert!(serial.write(&[data]).is_ok()),
-            Err(ReceiveError::Empty) => break,
-            Err(ReceiveError::NoSender) => break
-        }
-    }
 }
