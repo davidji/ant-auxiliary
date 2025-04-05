@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+message Set {
+    bool lights = 1;
+    int32 fan = 2;
+}
+
+message AuxRequest {
+    optional Set set = 1;
+}
+
+message Fan {
+    int32 power = 1;
+    int32 rate = 2;
+}
+
+message Temp {
+    int32 celcius = 1;
+    int32 humidity = 2;
+}
+
+message Status {
+    Temp temp = 1;
+    Fan fan = 2;
+}
+
+message AuxResponse {
+    Status status = 1;
+}
