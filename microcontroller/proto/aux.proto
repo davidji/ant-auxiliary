@@ -1,12 +1,19 @@
 syntax = "proto3";
 
+message Grbl {
+    bytes body = 1;
+}
+
 message Set {
     bool lights = 1;
     int32 fan = 2;
 }
 
-message AuxRequest {
-    optional Set set = 1;
+message Request {
+    oneof request {
+        Grbl grbl = 1;
+        Set set = 2;
+    }
 }
 
 message Fan {
@@ -24,6 +31,9 @@ message Status {
     Fan fan = 2;
 }
 
-message AuxResponse {
-    Status status = 1;
+message Response {
+    oneof response {
+        Grbl grbl = 1;
+        Status status = 2;
+    }
 }

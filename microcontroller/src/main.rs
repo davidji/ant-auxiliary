@@ -4,12 +4,13 @@
 #![no_std]
 #![allow(non_snake_case)]
 
-mod rpc;
+use panic_probe as _;
+use defmt_rtt as _;
+use defmt::error;
 
-use panic_semihosting as _;
 use cortex_m::asm::delay;
 use stm32f4xx_hal::{
-    gpio::{ gpioa::{self, PA1}, Output }, 
+    gpio::{ gpioa, gpioc::PC13, Output }, 
     pac::{ self, TIM2 },
     prelude::*,
     rcc,
@@ -19,12 +20,20 @@ use stm32f4xx_hal::{
 };
 use usb_device::prelude::*;
 use usbd_serial::embedded_io::ReadReady;
+use usbd_ethernet::{ DeviceState, Ethernet };
 use rtic_sync::{
     channel::*,
     make_channel
 };
 use nb::Error::WouldBlock;
 use rtic_monotonics::systick::prelude::*;
+
+use smoltcp::{
+    iface::{self, Interface, SocketHandle, SocketSet, SocketStorage},
+    socket::tcp,
+    wire::{ EthernetAddress, Ipv4Address, Ipv4Cidr },
+};
+
 
 systick_monotonic!(Mono, 1_000);
 
@@ -35,18 +44,22 @@ const SERIAL_CHANNEL_CAPACITY: usize = 128;
 type SerialChannelSender = Sender<'static, u8, SERIAL_CHANNEL_CAPACITY>;
 type SerialChannelReceiver = Receiver<'static, u8, SERIAL_CHANNEL_CAPACITY>;
 
+const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
 
-#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [SPI2, SPI3])]
+#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
 mod app {
 
     use super::*;
+
 
     #[shared]
     struct Shared {
         usb_dev: UsbDevice<'static, UsbBusType>,
         usb_serial: usbd_serial::SerialPort<'static, UsbBusType>,
         grbl_tx_sender: SerialChannelSender,
-
+        usb_ethernet: Ethernet<'static, UsbBus<USB>>,
+        interface: Interface,
+        sockets: SocketSet<'static>,
     }
 
     #[local]
@@ -57,11 +70,20 @@ mod app {
         grbl_rx_sender: SerialChannelSender,
         grbl_rx_receiver: SerialChannelReceiver,
         fan_pwm: PwmChannel<TIM2, 0>,
-        led: PA1<Output>,
+        led: PC13<Output>,
+    }
+    
+    fn now() -> smoltcp::time::Instant {
+        let time = Mono::now().duration_since_epoch().ticks();
+        smoltcp::time::Instant::from_millis(time as i64)
     }
 
-    #[init(local=[usb_bus: Option<usb_device::bus::UsbBusAllocator<UsbBusType>> = None,
-        ep_memory: [u32; 1024] = [0; 1024]])]
+    #[init(local=[
+        usb_bus: Option<usb_device::bus::UsbBusAllocator<UsbBusType>> = None,
+        ep_memory: [u32; 16384] = [0; 16384],
+        ethernet_in_buffer: [u8; 2048] = [0; 2048],
+        ethernet_out_buffer: [u8; 2048] = [0; 2048],
+        socket_storage: [SocketStorage<'static>; 1] = [SocketStorage::EMPTY; 1]])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
         let peripherals = cx.device;
@@ -71,11 +93,12 @@ mod app {
         let clocks: rcc::Clocks = rcc
             .cfgr
             .use_hse(25.MHz())
-            .sysclk(84.MHz())
+            .sysclk(100.MHz())
             .require_pll48clk()
             .freeze();
 
         let gpioa = peripherals.GPIOA.split();
+        let gpioc = peripherals.GPIOC.split();
 
         // BluePill board has a pull-up resistor on the D+ line.
         // Pull the D+ pin down to send a RESET condition to the USB bus.
@@ -98,6 +121,12 @@ mod app {
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
     
         let usb_serial = usbd_serial::SerialPort::new(usb_bus);
+        let mut usb_ethernet = usb_ethernet(
+            usb_bus, 
+            cx.local.ethernet_in_buffer, 
+            cx.local.ethernet_out_buffer);
+        let interface = usb_ethernet_interface(&mut usb_ethernet);
+        let sockets = SocketSet::new(&mut cx.local.socket_storage[..]);
 
         let (grbl_tx, mut grbl_rx) = grbl_serial(
             peripherals.USART1, 
@@ -107,15 +136,14 @@ mod app {
 
 
         // TIM2
-        let (_, (fan_pwm, ..)) = peripherals
-            .TIM2.pwm_hz(25.kHz(), &clocks);
+        let (_, (fan_pwm, ..)) = peripherals.TIM2.pwm_hz(25.kHz(), &clocks);
         let mut fan_pwm = fan_pwm.with(gpioa.pa0);
         fan_pwm.enable();
 
         let (grbl_tx_sender,grbl_tx_receiver) = make_channel!(u8, SERIAL_CHANNEL_CAPACITY);
         let (grbl_rx_sender, grbl_rx_receiver) = make_channel!(u8, SERIAL_CHANNEL_CAPACITY);
 
-        Mono::start(cx.core.SYST, 72_000_000);
+        Mono::start(cx.core.SYST, 100_000_000);
 
         blink::spawn().unwrap();
         grbl_serial_tx::spawn().unwrap();
@@ -123,10 +151,12 @@ mod app {
         grbl_rx.listen();
 
         (Shared {
-            usb_dev : grbl_usb_device(usb_bus), 
+            usb_dev : usb_device(usb_bus), 
             usb_serial,
             grbl_tx_sender,
-
+            usb_ethernet,
+            interface,
+            sockets
         }, 
         Local {
             grbl_tx,
@@ -135,7 +165,7 @@ mod app {
             grbl_rx_sender,
             grbl_rx_receiver,
             fan_pwm,
-            led: gpioa.pa1.into_push_pull_output()
+            led: gpioc.pc13.into_push_pull_output()
         })
     }
 
@@ -147,15 +177,22 @@ mod app {
         }
     }
 
-    #[task(binds = OTG_FS, shared = [usb_dev, usb_serial, grbl_tx_sender])]
+    #[task(binds = OTG_FS, shared = [usb_dev, usb_serial, usb_ethernet, grbl_tx_sender, interface, sockets])]
     fn usb_hp(cx: usb_hp::Context) {
         let mut shared = (
             cx.shared.usb_dev, 
             cx.shared.usb_serial,
-            cx.shared.grbl_tx_sender);
-        shared.lock(|dev, serial, sender| {
-            if dev.poll(&mut [serial]) {
+            cx.shared.grbl_tx_sender,
+            cx.shared.usb_ethernet,
+            cx.shared.interface,
+            cx.shared.sockets
+            );
+        shared.lock(|dev, serial, sender, ethernet, interface, sockets| {
+            if dev.poll(&mut [serial, ethernet]) {
                 usb_serial_read(serial, sender);
+                if usb_ethernet_connect(ethernet) {
+                    interface.poll(now(), ethernet, sockets);
+                }
             }
         });
     }
@@ -214,7 +251,7 @@ mod app {
     }
 }
 
-fn grbl_usb_device(usb_bus: &usb_device::bus::UsbBusAllocator<UsbBus<USB>>) -> UsbDevice<'_, UsbBus<USB>> {
+fn usb_device(usb_bus: &usb_device::bus::UsbBusAllocator<UsbBus<USB>>) -> UsbDevice<'_, UsbBus<USB>> {
     UsbDeviceBuilder::new(
         usb_bus,
         UsbVidPid(0x16c0, 0x27dd),
@@ -222,10 +259,60 @@ fn grbl_usb_device(usb_bus: &usb_device::bus::UsbBusAllocator<UsbBus<USB>>) -> U
     .device_class(usbd_serial::USB_CLASS_CDC)
     .strings(&[StringDescriptors::default()
         .manufacturer("paraxial")
-        .product("ant pcb maker")
-        .serial_number("grbl")])
+        .product("pcb-mill")
+        .serial_number("aux")])
     .unwrap()
     .build()
+}
+
+fn usb_ethernet<'a>(
+    usb_alloc: &'a usb_device::bus::UsbBusAllocator<UsbBus<USB>>,
+    in_buffer: &'a mut [u8; 2048],
+    out_buffer: &'a mut [u8; 2048]) ->  Ethernet<'a, UsbBus<USB>> {
+
+    Ethernet::new(
+        usb_alloc,
+        DEVICE_MAC_ADDR,
+        64,
+        in_buffer,
+        out_buffer)
+}
+
+fn usb_ethernet_interface<'a>(ethernet: &mut Ethernet<'a, UsbBus<USB>>) -> Interface {
+    let mut interface_config = iface::Config::new(EthernetAddress(DEVICE_MAC_ADDR).into());
+    interface_config.random_seed = 0;
+
+    let mut interface = Interface::new(
+        interface_config,
+        ethernet,
+        smoltcp::time::Instant::ZERO);
+
+    interface.update_ip_addrs(|ip_addrs| {
+        ip_addrs
+            .push(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into())
+            .unwrap();
+    });
+
+    interface
+}
+
+fn usb_ethernet_connect(ethernet: &mut Ethernet<'_, UsbBus<USB>>) -> bool {
+    if ethernet.state() == DeviceState::Disconnected {
+        if ethernet.connection_speed().is_none() {
+            // 1000 Kps upload and download
+            match ethernet.set_connection_speed(1_000_000, 1_000_000) {
+                Ok(()) | Err(UsbError::WouldBlock) => {}
+                Err(e) => error!("Failed to set connection speed: {}", e),
+            }
+        } else if ethernet.state() == DeviceState::Disconnected {
+            match ethernet.connect() {
+                Ok(()) | Err(UsbError::WouldBlock) => {}
+                Err(e) => error!("Failed to connect: {}", e),
+            }
+        }
+    }
+
+    ethernet.state() == DeviceState::Connected
 }
 
 fn grbl_serial(
@@ -244,6 +331,8 @@ fn grbl_serial(
 
     return grbl_serial.split();
 }
+
+
 
 fn usb_serial_read(
     serial: &mut usbd_serial::SerialPort<'static, UsbBusType>, 
