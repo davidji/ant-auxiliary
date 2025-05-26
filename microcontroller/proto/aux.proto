@@ -1,39 +1,44 @@
 syntax = "proto3";
 
-message Grbl {
-    bytes body = 1;
-}
-
-message Set {
-    bool lights = 1;
-    int32 fan = 2;
-}
-
 message Request {
-    oneof request {
-        Grbl grbl = 1;
+    oneof peripheral {
+        FanRequest fan = 1;
+        TempRequest temp = 2;
+    }
+}
+
+message FanRequest {
+    message Set {
+        int32 duty = 1;
+    }
+
+    message Get { }
+
+    oneof command {
+        Get get = 1;
         Set set = 2;
     }
 }
 
-message Fan {
-    int32 power = 1;
-    int32 rate = 2;
+message TempRequest {
+    message Get { }
+
+    oneof command {
+        Get get = 1;
+    }
 }
 
-message Temp {
-    int32 celcius = 1;
-    int32 humidity = 2;
+message FanResponse {
+    int32 duty = 1;
 }
 
-message Status {
-    Temp temp = 1;
-    Fan fan = 2;
+message TempResponse {
+
 }
 
 message Response {
-    oneof response {
-        Grbl grbl = 1;
-        Status status = 2;
+    oneof peripheral {
+       FanResponse fan = 1;
+       TempResponse temp = 2;
     }
 }

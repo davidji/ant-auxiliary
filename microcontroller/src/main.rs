@@ -4,73 +4,101 @@
 #![no_std]
 #![allow(non_snake_case)]
 
+mod frequency;
+mod network;
+mod shell;
+mod serial;
+pub mod proto {
+    #![allow(clippy::all)]
+    #![allow(nonstandard_style, unused, irrefutable_let_patterns)]
+    include!(concat!(env!("OUT_DIR"), "/aux.rs"));
+}
+
+use network::{ NetworkStack, NetworkChannelStorage, RecvChannel };
+
 use panic_probe as _;
 use defmt_rtt as _;
-use defmt::error;
 
 use cortex_m::asm::delay;
 use stm32f4xx_hal::{
-    gpio::{ gpioa, gpioc::PC13, Output }, 
-    pac::{ self, TIM2 },
+    gpio::{
+        gpioa::PA1, 
+        gpioc::{ PC13, PC14 },
+        Input,
+        Output, 
+        OpenDrain,
+    }, 
+    pac::{ TIM2 },
     prelude::*,
     rcc,
-    serial, 
     timer::PwmChannel, 
     otg_fs::{UsbBus, UsbBusType, USB}
 };
+
 use usb_device::prelude::*;
-use usbd_serial::embedded_io::ReadReady;
-use usbd_ethernet::{ DeviceState, Ethernet };
-use rtic_sync::{
-    channel::*,
-    make_channel
-};
-use nb::Error::WouldBlock;
 use rtic_monotonics::systick::prelude::*;
 
 use smoltcp::{
-    iface::{self, Interface, SocketHandle, SocketSet, SocketStorage},
-    socket::tcp,
-    wire::{ EthernetAddress, Ipv4Address, Ipv4Cidr },
+    iface::{ SocketSet, SocketStorage},
+    wire::IpAddress,
 };
 
 
 systick_monotonic!(Mono, 1_000);
 
-type GrblTx = serial::Tx1;
-type GrblRx = serial::Rx1;
+const CHANNEL_CAPACITY: usize = network::MTU as usize;
 
-const SERIAL_CHANNEL_CAPACITY: usize = 128;
-type SerialChannelSender = Sender<'static, u8, SERIAL_CHANNEL_CAPACITY>;
-type SerialChannelReceiver = Receiver<'static, u8, SERIAL_CHANNEL_CAPACITY>;
+const SOCKET_ADDRESS: (IpAddress, u16) = (IpAddress::Ipv4(network::IP_ADDRESS), 1337);
+const CHANNELS: usize = 2;
 
-const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
-
-#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [EXTI0, EXTI1, EXTI2])]
+#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [EXTI4, EXTI9_5, EXTI15_10 ])]
 mod app {
 
+    use frequency::Ratio;
+    use proto::{ 
+        FanRequest, 
+        FanRequest_, 
+        FanResponse, 
+        Request, 
+        Request_::Peripheral as RequestPeripheral, 
+        Response, 
+        Response_::Peripheral as ResponsePeripheral, 
+        TempRequest };
+    use rtic_sync::make_channel;
+
+    use crate::{ 
+        frequency::Frequency, 
+        network::SendChannel, 
+        proto::TempResponse
+    };
+
+    use dht11;
+
     use super::*;
+
+    impl frequency::Proportion<u32> for u32 {}
+    type Duration = rtic_monotonics::fugit::Duration<u32, 1, 1_000>;
+    impl frequency::Value<Duration, u32> for Duration {} 
 
 
     #[shared]
     struct Shared {
-        usb_dev: UsbDevice<'static, UsbBusType>,
-        usb_serial: usbd_serial::SerialPort<'static, UsbBusType>,
-        grbl_tx_sender: SerialChannelSender,
-        usb_ethernet: Ethernet<'static, UsbBus<USB>>,
-        interface: Interface,
-        sockets: SocketSet<'static>,
+        usb: UsbDevice<'static, UsbBusType>,
+        network: NetworkStack<'static>,
     }
 
     #[local]
     struct Local {
-        grbl_tx: GrblTx, 
-        grbl_rx: GrblRx,
-        grbl_tx_receiver: SerialChannelReceiver,
-        grbl_rx_sender: SerialChannelSender,
-        grbl_rx_receiver: SerialChannelReceiver,
-        fan_pwm: PwmChannel<TIM2, 0>,
+        grbl_tx: serial::TxTask<'static>, 
+        grbl_rx: serial::RxTask<'static>,
+        network_recv: [RecvChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
+        requests: shell::CommandRequests<'static, CHANNEL_CAPACITY>,
+        responses: shell::CommandResponses<'static, CHANNEL_CAPACITY>,
+        network_send: [SendChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
+        fan_pwm: shell::TaskResponses<PwmChannel<TIM2, 0>>,
+        fan_freq: Frequency<PA1<Input>, Mono, u32>,
         led: PC13<Output>,
+        temp: shell::TaskResponses<dht11::Dht11<PC14<Output<OpenDrain>>>>,
     }
     
     fn now() -> smoltcp::time::Instant {
@@ -80,13 +108,15 @@ mod app {
 
     #[init(local=[
         usb_bus: Option<usb_device::bus::UsbBusAllocator<UsbBusType>> = None,
-        ep_memory: [u32; 16384] = [0; 16384],
+        ep_memory: [u32; 4096] = [0; 4096],
+        grbl_channel_storage: NetworkChannelStorage<CHANNEL_CAPACITY> = NetworkChannelStorage::new(),
+        shell_channel_storage: NetworkChannelStorage<CHANNEL_CAPACITY> = NetworkChannelStorage::new(),
         ethernet_in_buffer: [u8; 2048] = [0; 2048],
         ethernet_out_buffer: [u8; 2048] = [0; 2048],
-        socket_storage: [SocketStorage<'static>; 1] = [SocketStorage::EMPTY; 1]])]
+        socket_storage: [SocketStorage<'static>; CHANNELS] = [SocketStorage::EMPTY; CHANNELS]])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
-        let peripherals = cx.device;
+        let mut peripherals = cx.device;
         let rcc = peripherals.RCC.constrain();
       
 
@@ -120,52 +150,76 @@ mod app {
         
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
     
-        let usb_serial = usbd_serial::SerialPort::new(usb_bus);
-        let mut usb_ethernet = usb_ethernet(
+        let mut usb_ethernet = network::usb_ethernet(
             usb_bus, 
             cx.local.ethernet_in_buffer, 
             cx.local.ethernet_out_buffer);
-        let interface = usb_ethernet_interface(&mut usb_ethernet);
-        let sockets = SocketSet::new(&mut cx.local.socket_storage[..]);
+        let interface = network::interface(&mut usb_ethernet);
 
-        let (grbl_tx, mut grbl_rx) = grbl_serial(
+        let mut network = NetworkStack {
+            ethernet: usb_ethernet,
+            interface,
+            sockets:SocketSet::new(&mut cx.local.socket_storage[..])
+        };
+    
+        let grbl = serial::Tasks::new(
             peripherals.USART1, 
             gpioa.pa9.into(),
             gpioa.pa10, 
-            clocks);
+            clocks,
+            network.channel(cx.local.grbl_channel_storage));
 
+        let shell_channel = network.channel(cx.local.shell_channel_storage);
 
         // TIM2
         let (_, (fan_pwm, ..)) = peripherals.TIM2.pwm_hz(25.kHz(), &clocks);
         let mut fan_pwm = fan_pwm.with(gpioa.pa0);
         fan_pwm.enable();
 
-        let (grbl_tx_sender,grbl_tx_receiver) = make_channel!(u8, SERIAL_CHANNEL_CAPACITY);
-        let (grbl_rx_sender, grbl_rx_receiver) = make_channel!(u8, SERIAL_CHANNEL_CAPACITY);
+        let mut syscfg = peripherals.SYSCFG.constrain();
+        let fan_freq = Frequency::new(
+            gpioa.pa1.into_pull_up_input(), Ratio(9,1), &mut syscfg, &mut peripherals.EXTI);
 
         Mono::start(cx.core.SYST, 100_000_000);
 
         blink::spawn().unwrap();
         grbl_serial_tx::spawn().unwrap();
-        usb_tx::spawn().unwrap();
-        grbl_rx.listen();
+        usb_send::spawn().unwrap();
+        responses::spawn().unwrap();
+        requests::spawn().unwrap();
+
+        let (response_sender, 
+             response_receiver) = make_channel!(
+                shell::Message, 
+                { shell::MESSAGE_CAPACITY });
 
         (Shared {
-            usb_dev : usb_device(usb_bus), 
-            usb_serial,
-            grbl_tx_sender,
-            usb_ethernet,
-            interface,
-            sockets
-        }, 
-        Local {
-            grbl_tx,
-            grbl_rx,
-            grbl_tx_receiver,
-            grbl_rx_sender,
-            grbl_rx_receiver,
-            fan_pwm,
-            led: gpioc.pc13.into_push_pull_output()
+            usb : usb_device(usb_bus),
+            network
+         }, 
+         Local {
+            grbl_tx: grbl.tx,
+            grbl_rx: grbl.rx,
+            network_recv: [grbl.net.recv, shell_channel.net.recv],
+            network_send : [grbl.net.send, shell_channel.net.send],
+            requests: shell::CommandRequests {
+                requests: shell_channel.app.recv,
+                responses: response_sender.clone()
+            },
+            responses: shell::CommandResponses {
+                sender: shell_channel.app.send,
+                messages: response_receiver,
+            },
+            fan_pwm: shell::TaskResponses { 
+                task: fan_pwm, 
+                responses: response_sender.clone() 
+            },
+            fan_freq,
+            led: gpioc.pc13.into_push_pull_output(),
+            temp: shell::TaskResponses {
+                task: dht11::Dht11::new(gpioc.pc14.into_open_drain_output()),
+                responses: response_sender.clone(),
+            },
         })
     }
 
@@ -177,77 +231,95 @@ mod app {
         }
     }
 
-    #[task(binds = OTG_FS, shared = [usb_dev, usb_serial, usb_ethernet, grbl_tx_sender, interface, sockets])]
-    fn usb_hp(cx: usb_hp::Context) {
-        let mut shared = (
-            cx.shared.usb_dev, 
-            cx.shared.usb_serial,
-            cx.shared.grbl_tx_sender,
-            cx.shared.usb_ethernet,
-            cx.shared.interface,
-            cx.shared.sockets
-            );
-        shared.lock(|dev, serial, sender, ethernet, interface, sockets| {
-            if dev.poll(&mut [serial, ethernet]) {
-                usb_serial_read(serial, sender);
-                if usb_ethernet_connect(ethernet) {
-                    interface.poll(now(), ethernet, sockets);
-                }
+    #[task(binds = EXTI1, local = [fan_freq])]
+    fn fan_freq_edge(cx: fan_freq_edge::Context) {
+        cx.local.fan_freq.edge();
+    }
+
+    #[task(binds = OTG_FS, shared = [ usb, network ], local = [ network_recv ])]
+    fn usb_recv(cx: usb_recv::Context) {
+        let channels = cx.local.network_recv;
+        let mut shared = (cx.shared.usb, cx.shared.network);
+
+        shared.lock(|usb, network| {
+            if usb.poll(&mut [&mut network.ethernet]) {
+                network.try_recv(now(), channels);
             }
         });
     }
 
-    #[task(shared = [usb_dev, usb_serial], local = [grbl_rx_receiver])]
-    async fn usb_tx(cx: usb_tx::Context) {
-        let mut shared = (cx.shared.usb_dev, cx.shared.usb_serial);
+    #[task(shared = [ usb, network ], local = [ network_send ])]
+    async fn usb_send(cx: usb_send::Context) {
+        let channels = cx.local.network_send;
+        let mut shared = (cx.shared.usb, cx.shared.network);
+
         loop {
-            match cx.local.grbl_rx_receiver.recv().await {
-                Ok(data) => 
-                    while ! shared.lock(|dev, serial| {
-                        match serial.write(&[data]) {
-                            Ok(_) => true,
-                            Err(UsbError::WouldBlock) => { dev.poll(&mut [serial]); false },
-                            Err(_) => panic!("Error writing to GRBL serial")
-                        }
-                    }) {
-                        Mono::delay(5.millis()).await;
-                    },
-                Err(_) => Mono::delay(5.millis()).await
-            }
+            shared.lock(|usb, network| {
+                usb.poll(&mut [&mut network.ethernet]);
+                network.try_send(now(), channels);
+            });
+
+            Mono::delay(1.millis()).await;
         }
     }
 
-    #[task(binds = USART1, local=[grbl_rx, grbl_rx_sender])] 
+
+    #[task(binds = USART1, local=[ grbl_rx ], priority=3)] 
     fn grbl_serial_interrupt(cx: grbl_serial_interrupt::Context) {
         let grbl_rx = cx.local.grbl_rx;
-        while grbl_rx.is_rx_not_empty() {
-            match grbl_rx.read() {
-                Ok(data) => cx.local.grbl_rx_sender.try_send(data).unwrap(),
-                Err(_) => panic!("Error reading from GRBL serial")
-            }
-        }
+        grbl_rx.receive();
     }
 
-    #[task(local = [ grbl_tx, grbl_tx_receiver])]
+    #[task(local = [ grbl_tx])]
     async fn grbl_serial_tx(cx: grbl_serial_tx::Context) {
         let grbl_tx = cx.local.grbl_tx;
         loop {
-            match cx.local.grbl_tx_receiver.recv().await {
-                Ok(data) => loop {
-                    match grbl_tx.write(data) {
-                        Ok(_) => break,
-                        Err(WouldBlock) => Mono::delay(5.millis()).await,
-                        Err(_) => panic!("Error writing to GRBL serial")
-                    }
-                },
-                Err(_) => Mono::delay(5.millis()).await
-            };
+            grbl_tx.send().await;
         }
     }
- 
+
+    #[task(local = [requests])]
+    async fn requests(cx: requests::Context) {
+        match cx.local.requests.receive().await {
+            Request { peripheral: Some(RequestPeripheral::Fan(request)) } => {
+                let _ = fan::spawn(request);
+            },
+            Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
+                let _ = temp::spawn(request);
+            },
+            Request { peripheral: None } => {}
+        };
+    }
+
+    #[task(local = [ responses ])]
+    async fn responses(cx: responses::Context) {
+        cx.local.responses.send().await;
+    }
+
+
+    #[task(local=[temp])]
+    async fn temp(cx: temp::Context, _: TempRequest) {
+        let temp = cx.local.temp;
+        temp.responses.send(Response {
+            peripheral: Some(ResponsePeripheral::Temp(TempResponse {
+
+            }))
+        }).await.unwrap();
+    }
+
     #[task(local=[fan_pwm])]
-    async fn set_fan_speed(cx: set_fan_speed::Context, duty: u16) {
-        cx.local.fan_pwm.set_duty(duty);
+    async fn fan(cx: fan::Context, request: FanRequest) {
+        let fan_pwm = cx.local.fan_pwm;
+        match request {
+            FanRequest { command: Some(FanRequest_::Command::Set(set)) } => { 
+                fan_pwm.task.set_duty(set.duty as u16);
+            },
+            FanRequest { command: _ } => { }
+        }
+
+        fan_pwm.responses.send(Response { peripheral: Some(ResponsePeripheral::Fan(FanResponse {
+            duty: fan_pwm.task.get_duty() as i32
+        })) }).await.unwrap();
     }
 }
 
@@ -256,7 +328,7 @@ fn usb_device(usb_bus: &usb_device::bus::UsbBusAllocator<UsbBus<USB>>) -> UsbDev
         usb_bus,
         UsbVidPid(0x16c0, 0x27dd),
     )
-    .device_class(usbd_serial::USB_CLASS_CDC)
+    .device_class(usbd_ethernet::USB_CLASS_CDC)
     .strings(&[StringDescriptors::default()
         .manufacturer("paraxial")
         .product("pcb-mill")
@@ -265,85 +337,4 @@ fn usb_device(usb_bus: &usb_device::bus::UsbBusAllocator<UsbBus<USB>>) -> UsbDev
     .build()
 }
 
-fn usb_ethernet<'a>(
-    usb_alloc: &'a usb_device::bus::UsbBusAllocator<UsbBus<USB>>,
-    in_buffer: &'a mut [u8; 2048],
-    out_buffer: &'a mut [u8; 2048]) ->  Ethernet<'a, UsbBus<USB>> {
 
-    Ethernet::new(
-        usb_alloc,
-        DEVICE_MAC_ADDR,
-        64,
-        in_buffer,
-        out_buffer)
-}
-
-fn usb_ethernet_interface<'a>(ethernet: &mut Ethernet<'a, UsbBus<USB>>) -> Interface {
-    let mut interface_config = iface::Config::new(EthernetAddress(DEVICE_MAC_ADDR).into());
-    interface_config.random_seed = 0;
-
-    let mut interface = Interface::new(
-        interface_config,
-        ethernet,
-        smoltcp::time::Instant::ZERO);
-
-    interface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
-            .push(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into())
-            .unwrap();
-    });
-
-    interface
-}
-
-fn usb_ethernet_connect(ethernet: &mut Ethernet<'_, UsbBus<USB>>) -> bool {
-    if ethernet.state() == DeviceState::Disconnected {
-        if ethernet.connection_speed().is_none() {
-            // 1000 Kps upload and download
-            match ethernet.set_connection_speed(1_000_000, 1_000_000) {
-                Ok(()) | Err(UsbError::WouldBlock) => {}
-                Err(e) => error!("Failed to set connection speed: {}", e),
-            }
-        } else if ethernet.state() == DeviceState::Disconnected {
-            match ethernet.connect() {
-                Ok(()) | Err(UsbError::WouldBlock) => {}
-                Err(e) => error!("Failed to connect: {}", e),
-            }
-        }
-    }
-
-    ethernet.state() == DeviceState::Connected
-}
-
-fn grbl_serial(
-    usart: pac::USART1,
-    tx: gpioa::PA9,
-    rx: gpioa::PA10,
-    clocks: rcc::Clocks) -> (GrblTx, GrblRx) {
-      // Create an interface struct for USART1 with 115200 Baud
-      let grbl_serial: serial::Serial<pac::USART1> = serial::Serial::new(
-          usart,
-          (tx, rx),
-          serial::Config::default()
-              .baudrate(115200.bps())
-              .parity_none(),
-          &clocks).unwrap();
-
-    return grbl_serial.split();
-}
-
-
-
-fn usb_serial_read(
-    serial: &mut usbd_serial::SerialPort<'static, UsbBusType>, 
-    sender: &mut SerialChannelSender) {
-
-    let mut buf = [0u8; 1];
-    while serial.read_ready().unwrap() && !sender.is_full() {
-        match serial.read(&mut buf) {
-            Ok(_) => sender.try_send(buf[0]).unwrap(),
-            Err(_) => panic!("Error writing to USB serial"),
-        };
-    }
-
-}
