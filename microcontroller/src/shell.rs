@@ -2,11 +2,10 @@
 
 use micropb::{ PbDecoder, PbEncoder, PbWrite, MessageDecode, MessageEncode};
 use rtic_sync::channel::{ Receiver, Sender};
-use defmt::{ error, self };
+use defmt::{ debug, error };
 
 use crate::proto::{ Request, Response };
 use cobs::{ CobsDecoder, CobsEncoder, DestBufTooSmallError };
-use heapless::Vec;
 
 pub const MESSAGE_SIZE: usize = 64;
 pub const MESSAGE_CAPACITY: usize = 4;
@@ -25,12 +24,13 @@ impl <const N: usize> CommandRequests<'_, N> {
         let mut buffer: [u8; MESSAGE_SIZE] = [0; MESSAGE_SIZE];
         loop {
             let size = self.frame(&mut buffer).await;
+            debug!("message received {:x}", buffer);
             let mut request = Request::default();
             let mut pb = PbDecoder::new(buffer.as_slice());
             match request.decode(&mut pb, size) {
                 Ok(()) => { return request; },
                 Err(_) => {
-                    error!("pb decode");
+                    error!("pb decode {}", buffer);
                 }
             }
         }
@@ -42,6 +42,7 @@ impl <const N: usize> CommandRequests<'_, N> {
         while let None = optional {
             optional = match self.requests.recv().await {
                 Ok(data) => {
+                    debug!("byte received {:x}", data);
                     match cobs.feed(data) {
                         Ok(None) => None,
                         Ok(Some(size)) => Some(size),
@@ -90,17 +91,20 @@ impl <const N: usize> CommandResponses<'_, N> {
         loop {
             match self.messages.recv().await {
                 Ok(message) => {
-                    let mut buffer = Vec::<u8, MESSAGE_SIZE>::new();
+                    debug!("received response");
+                    let mut buffer: [u8;MESSAGE_SIZE] = [0;MESSAGE_SIZE];
                     let mut cobs = PbCobsEncoder::new(&mut buffer);
                     let mut encoder = PbEncoder::new(&mut cobs);
                     match message.encode(&mut encoder) {
                         Ok(()) => {
-                            let _ = cobs.0.finalize();
-                            for data in buffer {
-                                self.sender.send(data).await.unwrap();
+                            let size = cobs.0.finalize();
+                            debug!("sending response {:x}", buffer[0..size]);
+                            for data in buffer[0..size].iter() {
+                                self.sender.send(*data).await.unwrap();
                             }
+                            self.sender.send(0).await.unwrap();
                         },
-                        Err(DestBufTooSmallError) => {}
+                        Err(DestBufTooSmallError) => error!("destination buffer too small")
                     }
                 },
                 Err(e) => { 

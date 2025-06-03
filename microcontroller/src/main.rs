@@ -1,11 +1,10 @@
-//! CDC-ACM serial port example using cortex-m-rtic.
-//! Target board: Blue Pill
+
 #![no_main]
 #![no_std]
-#![allow(non_snake_case)]
 
 mod frequency;
 mod network;
+mod seed;
 mod shell;
 mod serial;
 pub mod proto {
@@ -28,7 +27,7 @@ use stm32f4xx_hal::{
         Output, 
         OpenDrain,
     }, 
-    pac::{ TIM2 },
+    pac::{ TIM3 },
     prelude::*,
     rcc,
     timer::PwmChannel, 
@@ -36,19 +35,16 @@ use stm32f4xx_hal::{
 };
 
 use usb_device::prelude::*;
-use rtic_monotonics::systick::prelude::*;
+use rtic_monotonics::{ Monotonic, stm32_tim2_monotonic };
 
 use smoltcp::{
-    iface::{ SocketSet, SocketStorage},
-    wire::IpAddress,
+    iface::{ SocketStorage },
 };
 
+const MONO_RATE: u32 = 1_000_000;
+stm32_tim2_monotonic!(Mono, MONO_RATE);
 
-systick_monotonic!(Mono, 1_000);
-
-const CHANNEL_CAPACITY: usize = network::MTU as usize;
-
-const SOCKET_ADDRESS: (IpAddress, u16) = (IpAddress::Ipv4(network::IP_ADDRESS), 1337);
+const CHANNEL_CAPACITY: usize = 2*network::MTU as usize;
 const CHANNELS: usize = 2;
 
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [EXTI4, EXTI9_5, EXTI15_10 ])]
@@ -64,7 +60,8 @@ mod app {
         Response, 
         Response_::Peripheral as ResponsePeripheral, 
         TempRequest };
-    use rtic_sync::make_channel;
+    use rtic_sync::{channel::NoReceiver, make_channel};
+    use stm32f4xx_hal::adc::{config::AdcConfig, Adc};
 
     use crate::{ 
         frequency::Frequency, 
@@ -72,19 +69,26 @@ mod app {
         proto::TempResponse
     };
 
-    use dht11;
+    use defmt::{ debug, info, warn };
 
     use super::*;
 
     impl frequency::Proportion<u32> for u32 {}
-    type Duration = rtic_monotonics::fugit::Duration<u32, 1, 1_000>;
+    type Duration = rtic_monotonics::fugit::Duration<u64, 1, MONO_RATE>;
+    type Instant = rtic_monotonics::fugit::Instant<u64, 1, MONO_RATE>;
     impl frequency::Value<Duration, u32> for Duration {} 
-
-
+    
+    impl network::IntoInstant for Instant {
+        fn into_instant(self) -> smoltcp::time::Instant {
+            let time = self.duration_since_epoch().to_micros();
+            smoltcp::time::Instant::from_micros(time as i64)
+        }
+    }
+    
     #[shared]
     struct Shared {
         usb: UsbDevice<'static, UsbBusType>,
-        network: NetworkStack<'static>,
+        network: NetworkStack<'static, Mono>,
     }
 
     #[local]
@@ -95,16 +99,13 @@ mod app {
         requests: shell::CommandRequests<'static, CHANNEL_CAPACITY>,
         responses: shell::CommandResponses<'static, CHANNEL_CAPACITY>,
         network_send: [SendChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
-        fan_pwm: shell::TaskResponses<PwmChannel<TIM2, 0>>,
+        fan_pwm: shell::TaskResponses<PwmChannel<TIM3, 0>>,
         fan_freq: Frequency<PA1<Input>, Mono, u32>,
         led: PC13<Output>,
         temp: shell::TaskResponses<dht11::Dht11<PC14<Output<OpenDrain>>>>,
     }
     
-    fn now() -> smoltcp::time::Instant {
-        let time = Mono::now().duration_since_epoch().ticks();
-        smoltcp::time::Instant::from_millis(time as i64)
-    }
+
 
     #[init(local=[
         usb_bus: Option<usb_device::bus::UsbBusAllocator<UsbBusType>> = None,
@@ -126,6 +127,8 @@ mod app {
             .sysclk(100.MHz())
             .require_pll48clk()
             .freeze();
+
+        Mono::start(100_000_000);
 
         let gpioa = peripherals.GPIOA.split();
         let gpioc = peripherals.GPIOC.split();
@@ -150,37 +153,35 @@ mod app {
         
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
     
-        let mut usb_ethernet = network::usb_ethernet(
+        let usb_ethernet: usbd_ethernet::Ethernet<'_, UsbBus<USB>> = network::usb_ethernet(
             usb_bus, 
             cx.local.ethernet_in_buffer, 
             cx.local.ethernet_out_buffer);
-        let interface = network::interface(&mut usb_ethernet);
 
-        let mut network = NetworkStack {
-            ethernet: usb_ethernet,
-            interface,
-            sockets:SocketSet::new(&mut cx.local.socket_storage[..])
-        };
+        let mut network = NetworkStack::new(
+            usb_ethernet, 
+            &mut cx.local.socket_storage[..],
+            seed::seed(
+                &mut Adc::adc1(peripherals.ADC1, true, AdcConfig::default()), 
+                &mut gpioa.pa3.into_analog()));
     
         let grbl = serial::Tasks::new(
             peripherals.USART1, 
             gpioa.pa9.into(),
             gpioa.pa10, 
             clocks,
-            network.channel(cx.local.grbl_channel_storage));
+            network.channel(1337, cx.local.grbl_channel_storage));
 
-        let shell_channel = network.channel(cx.local.shell_channel_storage);
+        let shell_channel = network.channel(1338, cx.local.shell_channel_storage);
 
         // TIM2
-        let (_, (fan_pwm, ..)) = peripherals.TIM2.pwm_hz(25.kHz(), &clocks);
-        let mut fan_pwm = fan_pwm.with(gpioa.pa0);
+        let (_, (fan_pwm, ..)) = peripherals.TIM3.pwm_hz(25.kHz(), &clocks);
+        let mut fan_pwm = fan_pwm.with(gpioa.pa6);
         fan_pwm.enable();
 
         let mut syscfg = peripherals.SYSCFG.constrain();
         let fan_freq = Frequency::new(
             gpioa.pa1.into_pull_up_input(), Ratio(9,1), &mut syscfg, &mut peripherals.EXTI);
-
-        Mono::start(cx.core.SYST, 100_000_000);
 
         blink::spawn().unwrap();
         grbl_serial_tx::spawn().unwrap();
@@ -226,7 +227,7 @@ mod app {
     #[task(local = [ led ])]
     async fn blink(cx: blink::Context) {
         loop {
-            Mono::delay(1000.millis()).await;
+            Mono::delay(1000.millis().into()).await;
             cx.local.led.toggle();
         }
     }
@@ -243,7 +244,7 @@ mod app {
 
         shared.lock(|usb, network| {
             if usb.poll(&mut [&mut network.ethernet]) {
-                network.try_recv(now(), channels);
+                network.try_recv(channels);
             }
         });
     }
@@ -256,10 +257,10 @@ mod app {
         loop {
             shared.lock(|usb, network| {
                 usb.poll(&mut [&mut network.ethernet]);
-                network.try_send(now(), channels);
+                network.try_send(channels);
             });
 
-            Mono::delay(1.millis()).await;
+            Mono::delay(1.millis().into()).await;
         }
     }
 
@@ -280,20 +281,26 @@ mod app {
 
     #[task(local = [requests])]
     async fn requests(cx: requests::Context) {
-        match cx.local.requests.receive().await {
-            Request { peripheral: Some(RequestPeripheral::Fan(request)) } => {
-                let _ = fan::spawn(request);
-            },
-            Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
-                let _ = temp::spawn(request);
-            },
-            Request { peripheral: None } => {}
-        };
+        loop {
+            match cx.local.requests.receive().await {
+                Request { peripheral: Some(RequestPeripheral::Fan(request)) } => {
+                    let _ = fan::spawn(request);
+                },
+                Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
+                    let _ = temp::spawn(request);
+                },
+                Request { peripheral: None } => {
+                    warn!("No peripheral specified")
+                }
+            };
+        }
     }
 
     #[task(local = [ responses ])]
     async fn responses(cx: responses::Context) {
+        debug!("response relay starting");
         cx.local.responses.send().await;
+        debug!("response relay exit");
     }
 
 
@@ -311,15 +318,22 @@ mod app {
     async fn fan(cx: fan::Context, request: FanRequest) {
         let fan_pwm = cx.local.fan_pwm;
         match request {
-            FanRequest { command: Some(FanRequest_::Command::Set(set)) } => { 
+            FanRequest { command: Some(FanRequest_::Command::Set(set)) } => {
+                info!("fan set duty {}", set.duty);
                 fan_pwm.task.set_duty(set.duty as u16);
             },
-            FanRequest { command: _ } => { }
+            FanRequest { command: Some(FanRequest_::Command::Get(_)) } => { },
+            FanRequest { command: _ } => {
+                warn!("Unknown command for fan");
+            }
         }
 
-        fan_pwm.responses.send(Response { peripheral: Some(ResponsePeripheral::Fan(FanResponse {
+        match fan_pwm.responses.send(Response { peripheral: Some(ResponsePeripheral::Fan(FanResponse {
             duty: fan_pwm.task.get_duty() as i32
-        })) }).await.unwrap();
+        })) }).await {
+            Ok(()) => debug!("sent response"),
+            Err(NoReceiver(_)) => debug!("error sending response (no receiver)"),
+        }
     }
 }
 

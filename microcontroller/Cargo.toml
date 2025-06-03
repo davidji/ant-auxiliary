@@ -24,7 +24,7 @@ nb = "1.1.0"
 usb-device = "0.3.2"
 usbd-serial = "0.2.2"
 usbd-ethernet = { version = "0.4.0", features = [ "defmt" ] }
-rtic-monotonics = { version = "2.0.3", features = [ "cortex-m-systick" ]}
+rtic-monotonics = { version = "2.0.3", features = [ "stm32_tim2", "stm32-metapac", "stm32f411ce", "defmt" ]}
 rtic-sync = { version = "1.3.2", features = ["defmt-03" ]}
 heapless = { version = "0.8", features = [ "defmt-03"] }
 futures = { version = "0.3.31", default-features = false, features=["async-await"] }
@@ -38,8 +38,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
 micropb = { version = "0.1.2", features = ["container-heapless"] }
 cobs = { version = "0.3.0",  default-features = false, features = [ "defmt" ] }
 never = { version = "0.1.0", default-features = false }
-
 dht11 = "0.3.1"
+fugit = "0.3.7"
 
 [build-dependencies]
 micropb-gen = "0.1.2"

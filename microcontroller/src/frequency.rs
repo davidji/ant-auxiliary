@@ -20,7 +20,7 @@ pub struct Frequency<PIN: ExtiPin, CLOCK: Monotonic, R: Proportion<R>> {
     pin: PIN,
     filter: Ratio<R>,
     previous: Option<CLOCK::Instant>,
-    interval: Option<CLOCK::Duration>
+    interval: Option<CLOCK::Duration>,
 }
 
 impl <PIN: ExtiPin, CLOCK: Monotonic, R> Frequency<PIN, CLOCK, R>

@@ -8,14 +8,14 @@ use stm32f4xx_hal::{
 
 use nb::Error::WouldBlock;
 use rtic_sync::channel::*;
-use rtic_monotonics::systick::prelude::*;
+use rtic_monotonics::Monotonic;
 use crate::Mono;
 use crate::network::{ NetworkChannel, NetworkEndpoint };
 
 pub type GrblTx = serial::Tx1;
 pub type GrblRx = serial::Rx1;
 
-const CHANNEL_CAPACITY: usize = crate::network::MTU as usize;
+const CHANNEL_CAPACITY: usize = 2*crate::network::MTU as usize;
 
 pub struct TxTask<'a> {
     tx: GrblTx, 
@@ -28,11 +28,11 @@ impl <'a> TxTask<'a> {
             Ok(data) => loop {
                 match self.tx.write(data) {
                     Ok(_) => break,
-                    Err(WouldBlock) => Mono::delay(1.millis()).await,
+                    Err(WouldBlock) => Mono::delay(1.millis().into()).await,
                     Err(_) => panic!("Error writing to GRBL serial")
                 }
             },
-            Err(_) => Mono::delay(5.millis()).await
+            Err(_) => Mono::delay(5.millis().into()).await
         };
     }
 }
