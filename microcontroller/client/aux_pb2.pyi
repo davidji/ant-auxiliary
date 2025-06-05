@@ -38,10 +38,12 @@ class TempRequest(_message.Message):
     def __init__(self, get: _Optional[_Union[TempRequest.Get, _Mapping]] = ...) -> None: ...
 
 class FanResponse(_message.Message):
-    __slots__ = ("duty",)
+    __slots__ = ("duty", "rpm")
     DUTY_FIELD_NUMBER: _ClassVar[int]
+    RPM_FIELD_NUMBER: _ClassVar[int]
     duty: int
-    def __init__(self, duty: _Optional[int] = ...) -> None: ...
+    rpm: int
+    def __init__(self, duty: _Optional[int] = ..., rpm: _Optional[int] = ...) -> None: ...
 
 class TempResponse(_message.Message):
     __slots__ = ()

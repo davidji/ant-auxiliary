@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\taux.proto\"Q\n\x07Request\x12\x1a\n\x03\x66\x61n\x18\x01 \x01(\x0b\x32\x0b.FanRequestH\x00\x12\x1c\n\x04temp\x18\x02 \x01(\x0b\x32\x0c.TempRequestH\x00\x42\x0c\n\nperipheral\"s\n\nFanRequest\x12\x1e\n\x03get\x18\x01 \x01(\x0b\x32\x0f.FanRequest.GetH\x00\x12\x1e\n\x03set\x18\x02 \x01(\x0b\x32\x0f.FanRequest.SetH\x00\x1a\x13\n\x03Set\x12\x0c\n\x04\x64uty\x18\x01 \x01(\x05\x1a\x05\n\x03GetB\t\n\x07\x63ommand\"@\n\x0bTempRequest\x12\x1f\n\x03get\x18\x01 \x01(\x0b\x32\x10.TempRequest.GetH\x00\x1a\x05\n\x03GetB\t\n\x07\x63ommand\"\x1b\n\x0b\x46\x61nResponse\x12\x0c\n\x04\x64uty\x18\x01 \x01(\x05\"\x0e\n\x0cTempResponse\"T\n\x08Response\x12\x1b\n\x03\x66\x61n\x18\x01 \x01(\x0b\x32\x0c.FanResponseH\x00\x12\x1d\n\x04temp\x18\x02 \x01(\x0b\x32\r.TempResponseH\x00\x42\x0c\n\nperipheralb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\taux.proto\"Q\n\x07Request\x12\x1a\n\x03\x66\x61n\x18\x01 \x01(\x0b\x32\x0b.FanRequestH\x00\x12\x1c\n\x04temp\x18\x02 \x01(\x0b\x32\x0c.TempRequestH\x00\x42\x0c\n\nperipheral\"s\n\nFanRequest\x12\x1e\n\x03get\x18\x01 \x01(\x0b\x32\x0f.FanRequest.GetH\x00\x12\x1e\n\x03set\x18\x02 \x01(\x0b\x32\x0f.FanRequest.SetH\x00\x1a\x13\n\x03Set\x12\x0c\n\x04\x64uty\x18\x01 \x01(\x05\x1a\x05\n\x03GetB\t\n\x07\x63ommand\"@\n\x0bTempRequest\x12\x1f\n\x03get\x18\x01 \x01(\x0b\x32\x10.TempRequest.GetH\x00\x1a\x05\n\x03GetB\t\n\x07\x63ommand\"(\n\x0b\x46\x61nResponse\x12\x0c\n\x04\x64uty\x18\x01 \x01(\x05\x12\x0b\n\x03rpm\x18\x02 \x01(\x05\"\x0e\n\x0cTempResponse\"T\n\x08Response\x12\x1b\n\x03\x66\x61n\x18\x01 \x01(\x0b\x32\x0c.FanResponseH\x00\x12\x1d\n\x04temp\x18\x02 \x01(\x0b\x32\r.TempResponseH\x00\x42\x0c\n\nperipheralb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -44,9 +44,9 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TEMPREQUEST_GET']._serialized_start=195
   _globals['_TEMPREQUEST_GET']._serialized_end=200
   _globals['_FANRESPONSE']._serialized_start=279
-  _globals['_FANRESPONSE']._serialized_end=306
-  _globals['_TEMPRESPONSE']._serialized_start=308
-  _globals['_TEMPRESPONSE']._serialized_end=322
-  _globals['_RESPONSE']._serialized_start=324
-  _globals['_RESPONSE']._serialized_end=408
+  _globals['_FANRESPONSE']._serialized_end=319
+  _globals['_TEMPRESPONSE']._serialized_start=321
+  _globals['_TEMPRESPONSE']._serialized_end=335
+  _globals['_RESPONSE']._serialized_start=337
+  _globals['_RESPONSE']._serialized_end=421
 # @@protoc_insertion_point(module_scope)

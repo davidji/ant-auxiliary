@@ -6,8 +6,9 @@ async def connect():
 
     async def send():
         for i in range(10):
-            connection.fan_set_duty(0.5)
-            await asyncio.sleep(1)
+            connection.fan_set_duty(i*0.01)
+            await asyncio.sleep(3)
+        connection.fan_set_duty(0.02)
 
     await asyncio.gather(connection.print_received(), send())
 

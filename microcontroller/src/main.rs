@@ -1,7 +1,9 @@
 
 #![no_main]
 #![no_std]
+#[allow(non_snake_case)]
 
+mod fan;
 mod frequency;
 mod network;
 mod seed;
@@ -27,22 +29,29 @@ use stm32f4xx_hal::{
         Output, 
         OpenDrain,
     }, 
-    pac::{ TIM3 },
     prelude::*,
     rcc,
-    timer::PwmChannel, 
     otg_fs::{UsbBus, UsbBusType, USB}
 };
 
 use usb_device::prelude::*;
-use rtic_monotonics::{ Monotonic, stm32_tim2_monotonic };
+use rtic_monotonics::{
+    fugit, 
+    Monotonic, 
+    stm32_tim2_monotonic 
+};
 
 use smoltcp::{
     iface::{ SocketStorage },
 };
 
+
 const MONO_RATE: u32 = 1_000_000;
 stm32_tim2_monotonic!(Mono, MONO_RATE);
+impl frequency::Proportion<u32> for u32 {}
+type Duration = fugit::Duration<u64, 1, MONO_RATE>;
+type Instant = fugit::Instant<u64, 1, MONO_RATE>;
+impl frequency::Value<Duration, u32> for Duration {} 
 
 const CHANNEL_CAPACITY: usize = 2*network::MTU as usize;
 const CHANNELS: usize = 2;
@@ -50,34 +59,31 @@ const CHANNELS: usize = 2;
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [EXTI4, EXTI9_5, EXTI15_10 ])]
 mod app {
 
-    use frequency::Ratio;
     use proto::{ 
-        FanRequest, 
-        FanRequest_, 
-        FanResponse, 
+        FanRequest,
         Request, 
         Request_::Peripheral as RequestPeripheral, 
         Response, 
         Response_::Peripheral as ResponsePeripheral, 
         TempRequest };
-    use rtic_sync::{channel::NoReceiver, make_channel};
+    use rtic_sync::{
+        make_channel, 
+        make_signal, 
+        signal::{ Signal }
+    };
     use stm32f4xx_hal::adc::{config::AdcConfig, Adc};
 
     use crate::{ 
-        frequency::Frequency, 
+        frequency::{ Bounds, Frequency, Ratio }, 
         network::SendChannel, 
-        proto::TempResponse
+        proto::TempResponse,
     };
 
-    use defmt::{ debug, info, warn };
+    use defmt::{ debug, warn };
 
     use super::*;
 
-    impl frequency::Proportion<u32> for u32 {}
-    type Duration = rtic_monotonics::fugit::Duration<u64, 1, MONO_RATE>;
-    type Instant = rtic_monotonics::fugit::Instant<u64, 1, MONO_RATE>;
-    impl frequency::Value<Duration, u32> for Duration {} 
-    
+  
     impl network::IntoInstant for Instant {
         fn into_instant(self) -> smoltcp::time::Instant {
             let time = self.duration_since_epoch().to_micros();
@@ -99,8 +105,8 @@ mod app {
         requests: shell::CommandRequests<'static, CHANNEL_CAPACITY>,
         responses: shell::CommandResponses<'static, CHANNEL_CAPACITY>,
         network_send: [SendChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
-        fan_pwm: shell::TaskResponses<PwmChannel<TIM3, 0>>,
-        fan_freq: Frequency<PA1<Input>, Mono, u32>,
+        fan: fan::Fan<'static>,
+        fan_freq: Frequency<'static, PA1<Input>, Mono, u32>,
         led: PC13<Output>,
         temp: shell::TaskResponses<dht11::Dht11<PC14<Output<OpenDrain>>>>,
     }
@@ -174,14 +180,22 @@ mod app {
 
         let shell_channel = network.channel(1338, cx.local.shell_channel_storage);
 
-        // TIM2
+        let (fan_freq_writer, fan_freq_reader) = make_signal!(Duration);
+
         let (_, (fan_pwm, ..)) = peripherals.TIM3.pwm_hz(25.kHz(), &clocks);
         let mut fan_pwm = fan_pwm.with(gpioa.pa6);
         fan_pwm.enable();
 
+
         let mut syscfg = peripherals.SYSCFG.constrain();
         let fan_freq = Frequency::new(
-            gpioa.pa1.into_pull_up_input(), Ratio(9,1), &mut syscfg, &mut peripherals.EXTI);
+            gpioa.pa1.into_pull_up_input(), 
+            Ratio(9,1), 
+            Bounds(Duration::micros(10), Duration::secs(1)), 
+            &mut syscfg, 
+            &mut peripherals.EXTI,
+            fan_freq_writer,
+        );
 
         blink::spawn().unwrap();
         grbl_serial_tx::spawn().unwrap();
@@ -211,9 +225,12 @@ mod app {
                 sender: shell_channel.app.send,
                 messages: response_receiver,
             },
-            fan_pwm: shell::TaskResponses { 
-                task: fan_pwm, 
-                responses: response_sender.clone() 
+            fan: fan::Fan {
+                pwm: shell::TaskResponses { 
+                    task: fan_pwm, 
+                    responses: response_sender.clone()
+                },
+                freq_reader: fan_freq_reader,
             },
             fan_freq,
             led: gpioc.pc13.into_push_pull_output(),
@@ -230,11 +247,6 @@ mod app {
             Mono::delay(1000.millis().into()).await;
             cx.local.led.toggle();
         }
-    }
-
-    #[task(binds = EXTI1, local = [fan_freq])]
-    fn fan_freq_edge(cx: fan_freq_edge::Context) {
-        cx.local.fan_freq.edge();
     }
 
     #[task(binds = OTG_FS, shared = [ usb, network ], local = [ network_recv ])]
@@ -284,10 +296,10 @@ mod app {
         loop {
             match cx.local.requests.receive().await {
                 Request { peripheral: Some(RequestPeripheral::Fan(request)) } => {
-                    let _ = fan::spawn(request);
+                    let _ = fan_request::spawn(request);
                 },
                 Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
-                    let _ = temp::spawn(request);
+                    let _ = temp_request::spawn(request);
                 },
                 Request { peripheral: None } => {
                     warn!("No peripheral specified")
@@ -296,7 +308,7 @@ mod app {
         }
     }
 
-    #[task(local = [ responses ])]
+    #[task(local = [responses])]
     async fn responses(cx: responses::Context) {
         debug!("response relay starting");
         cx.local.responses.send().await;
@@ -305,7 +317,7 @@ mod app {
 
 
     #[task(local=[temp])]
-    async fn temp(cx: temp::Context, _: TempRequest) {
+    async fn temp_request(cx: temp_request::Context, _: TempRequest) {
         let temp = cx.local.temp;
         temp.responses.send(Response {
             peripheral: Some(ResponsePeripheral::Temp(TempResponse {
@@ -314,26 +326,14 @@ mod app {
         }).await.unwrap();
     }
 
-    #[task(local=[fan_pwm])]
-    async fn fan(cx: fan::Context, request: FanRequest) {
-        let fan_pwm = cx.local.fan_pwm;
-        match request {
-            FanRequest { command: Some(FanRequest_::Command::Set(set)) } => {
-                info!("fan set duty {}", set.duty);
-                fan_pwm.task.set_duty(set.duty as u16);
-            },
-            FanRequest { command: Some(FanRequest_::Command::Get(_)) } => { },
-            FanRequest { command: _ } => {
-                warn!("Unknown command for fan");
-            }
-        }
+    #[task(local=[fan])]
+    async fn fan_request(cx: fan_request::Context, request: FanRequest) {
+        cx.local.fan.process(request).await;
+    }
 
-        match fan_pwm.responses.send(Response { peripheral: Some(ResponsePeripheral::Fan(FanResponse {
-            duty: fan_pwm.task.get_duty() as i32
-        })) }).await {
-            Ok(()) => debug!("sent response"),
-            Err(NoReceiver(_)) => debug!("error sending response (no receiver)"),
-        }
+    #[task(binds = EXTI1, local = [fan_freq])]
+    fn fan_freq_edge(cx: fan_freq_edge::Context) {
+        cx.local.fan_freq.edge();
     }
 }
 

@@ -30,6 +30,7 @@ message TempRequest {
 
 message FanResponse {
     int32 duty = 1;
+    int32 rpm = 2;
 }
 
 message TempResponse {
