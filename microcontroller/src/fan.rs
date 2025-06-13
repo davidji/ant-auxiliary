@@ -15,10 +15,7 @@ use stm32f4xx_hal::{
     timer::PwmChannel, 
 };
 
-use rtic_sync::{
-        channel::NoReceiver, 
-        signal::SignalReader,
-    };
+use rtic_sync::signal::SignalReader;
 
 use crate::fugit::Rate;
 

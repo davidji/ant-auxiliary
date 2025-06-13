@@ -5,10 +5,10 @@ I need
 
  - A USB to serial adapter
  - Fan PWM control
- - OnWire temperature sensor monitoring
+ - OneWire temperature sensor monitoring
  - Fan and spindle RPM monitoring
 
-I have a STM32F103 Black Pill, which should be able to do all that, so this project
+I have a STM32F411 WeAct Black Pill V2, which should be able to do all that, so this project
 is to write a firmware that can do the above on it.
 
 I've gone for Rust and RTIC. When I first started messing around with embedded Rust,
