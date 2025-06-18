@@ -36,7 +36,6 @@ impl <V: Ord> Bounds<V> {
 }
 
 
-
 pub struct Frequency<'a, PIN: ExtiPin, CLOCK: Monotonic, R: Proportion<R>> {
     pin: PIN,
     filter: Ratio<R>,
@@ -48,7 +47,6 @@ pub struct Frequency<'a, PIN: ExtiPin, CLOCK: Monotonic, R: Proportion<R>> {
 
 impl <'a, PIN: ExtiPin, CLOCK: Monotonic, R> Frequency<'a, PIN, CLOCK, R>
 where 
-    PIN: ExtiPin,
     R: Proportion<R>,
     CLOCK::Duration: Value<CLOCK::Duration, R> {
     pub fn new(

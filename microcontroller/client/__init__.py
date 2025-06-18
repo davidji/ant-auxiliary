@@ -29,6 +29,11 @@ class AuxClient:
         request.fan.set.duty = int(0xffff*duty)
         self.send(request)
 
+    def temp(self):
+        request = aux.Request()
+        request.temp.get.SetInParent()
+        self.send(request)
+
     @staticmethod
     def protobuf_to_json(message):
         from google.protobuf.json_format import MessageToJson

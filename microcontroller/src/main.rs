@@ -6,9 +6,12 @@
 mod fan;
 mod frequency;
 mod network;
+mod dht11;
 mod seed;
 mod shell;
 mod serial;
+mod temp;
+
 pub mod proto {
     #![allow(clippy::all)]
     #![allow(nonstandard_style, unused, irrefutable_let_patterns)]
@@ -23,8 +26,11 @@ use defmt_rtt as _;
 use cortex_m::asm::delay;
 use stm32f4xx_hal::{
     gpio::{
-        gpioa::PA1, 
-        gpioc::{ PC13, PC14 },
+        gpioa::{ PA1, PA2 }, 
+        gpioc::{ 
+            PC2, // used for with PA2, to clear EXTI2 interrupts */ 
+            PC13, // led 
+        },
         Input,
         Output, 
         OpenDrain,
@@ -56,7 +62,7 @@ impl frequency::Value<Duration, u32> for Duration {}
 const CHANNEL_CAPACITY: usize = 2*network::MTU as usize;
 const CHANNELS: usize = 2;
 
-#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [EXTI4, EXTI9_5, EXTI15_10 ])]
+#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [ EXTI4, EXTI9_5, EXTI15_10 ])]
 mod app {
 
     use proto::{ 
@@ -65,21 +71,21 @@ mod app {
         Request_::Peripheral as RequestPeripheral, 
         Response, 
         Response_::Peripheral as ResponsePeripheral, 
-        TempRequest };
+    };
     use rtic_sync::{
         make_channel, 
         make_signal, 
         signal::{ Signal }
     };
-    use stm32f4xx_hal::adc::{config::AdcConfig, Adc};
+
+    use stm32f4xx_hal::{adc::{config::AdcConfig, Adc} };
 
     use crate::{ 
         frequency::{ Bounds, Frequency, Ratio }, 
-        network::SendChannel, 
-        proto::TempResponse,
+        network::SendChannel, proto::{TempRequest, TempResponse}, shell::TaskResponses,
     };
 
-    use defmt::{ debug, warn };
+    use defmt::{ debug, info, warn };
 
     use super::*;
 
@@ -95,6 +101,7 @@ mod app {
     struct Shared {
         usb: UsbDevice<'static, UsbBusType>,
         network: NetworkStack<'static, Mono>,
+        temp: Option<TempResponse>,
     }
 
     #[local]
@@ -108,7 +115,9 @@ mod app {
         fan: fan::Fan<'static>,
         fan_freq: Frequency<'static, PA1<Input>, Mono, u32>,
         led: PC13<Output>,
-        temp: shell::TaskResponses<dht11::Dht11<PC14<Output<OpenDrain>>>>,
+        temp_reader: dht11::Dht11Reader<'static, PA2<Output<OpenDrain>>>,
+        temp_writer: dht11::Dht11Writer<'static, PC2>,
+        temp_responses: TaskResponses<()>,
     }
     
 
@@ -202,15 +211,22 @@ mod app {
         usb_send::spawn().unwrap();
         responses::spawn().unwrap();
         requests::spawn().unwrap();
+        temp::spawn().unwrap();
 
         let (response_sender, 
              response_receiver) = make_channel!(
                 shell::Message, 
                 { shell::MESSAGE_CAPACITY });
 
+        let (temp_writer, temp_reader) = dht11::make(
+            gpioa.pa2.into_open_drain_output(),
+            gpioc.pc2,
+            &mut syscfg, &mut peripherals.EXTI);
+
         (Shared {
             usb : usb_device(usb_bus),
-            network
+            network,
+            temp: Option::None,
          }, 
          Local {
             grbl_tx: grbl.tx,
@@ -234,10 +250,12 @@ mod app {
             },
             fan_freq,
             led: gpioc.pc13.into_push_pull_output(),
-            temp: shell::TaskResponses {
-                task: dht11::Dht11::new(gpioc.pc14.into_open_drain_output()),
-                responses: response_sender.clone(),
-            },
+            temp_reader,
+            temp_writer,
+            temp_responses: shell::TaskResponses { 
+                    task: (), 
+                    responses: response_sender.clone()
+                },
         })
     }
 
@@ -249,7 +267,7 @@ mod app {
         }
     }
 
-    #[task(binds = OTG_FS, shared = [ usb, network ], local = [ network_recv ])]
+    #[task(binds = OTG_FS, shared = [ usb, network ], local = [ network_recv ], priority=1)]
     fn usb_recv(cx: usb_recv::Context) {
         let channels = cx.local.network_recv;
         let mut shared = (cx.shared.usb, cx.shared.network);
@@ -277,7 +295,7 @@ mod app {
     }
 
 
-    #[task(binds = USART1, local=[ grbl_rx ], priority=3)] 
+    #[task(binds = USART1, local=[ grbl_rx ], priority=2)] 
     fn grbl_serial_interrupt(cx: grbl_serial_interrupt::Context) {
         let grbl_rx = cx.local.grbl_rx;
         grbl_rx.receive();
@@ -299,7 +317,7 @@ mod app {
                     let _ = fan_request::spawn(request);
                 },
                 Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
-                    let _ = temp_request::spawn(request);
+                    let _  = temp_request::spawn(request);
                 },
                 Request { peripheral: None } => {
                     warn!("No peripheral specified")
@@ -316,14 +334,40 @@ mod app {
     }
 
 
-    #[task(local=[temp])]
-    async fn temp_request(cx: temp_request::Context, _: TempRequest) {
-        let temp = cx.local.temp;
-        temp.responses.send(Response {
-            peripheral: Some(ResponsePeripheral::Temp(TempResponse {
+    #[task(local=[temp_reader], shared=[temp])]
+    async fn temp(mut cx: temp::Context) {
+        let temp = cx.local.temp_reader;
+        Mono::delay(Duration::secs(10)).await;
+        loop {
+            let start = Mono::now();
+            match temp.read().await {
+                Ok(response) => {
+                    info!("temperature: {}C, humidity: {}%", response.degrees_c, response.humidity);
+                    cx.shared.temp.lock(|current| {
+                        current.replace(response)
+                    });
+                },
+                Err(err) => {
+                    warn!("Error reading temperature {}", err);
+                }
+            }
+            Mono::delay_until(start + Duration::secs(10)).await;
+        }
+    }
 
-            }))
+    #[task(local = [ temp_responses], shared = [temp])]
+    async fn temp_request(mut cx: temp_request::Context, _: TempRequest) {
+        let temp = cx.local.temp_responses;
+        let current = cx.shared.temp.lock(|current| current.clone());
+        temp.responses.send(Response {
+            peripheral: Some(ResponsePeripheral::Temp(current.unwrap_or(TempResponse::default())))
         }).await.unwrap();
+    }
+
+
+    #[task(binds=EXTI2, local=[temp_writer], priority=4)]
+    fn temp_edge(cx: temp_edge::Context) {
+        cx.local.temp_writer.edge();
     }
 
     #[task(local=[fan])]
