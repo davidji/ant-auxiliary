@@ -366,6 +366,8 @@ mod app {
 
 
     #[task(binds=EXTI2, local=[temp_writer], priority=4)]
+    #[inline(never)]
+    #[link_section = ".data.temp_edge"]
     fn temp_edge(cx: temp_edge::Context) {
         cx.local.temp_writer.edge();
     }

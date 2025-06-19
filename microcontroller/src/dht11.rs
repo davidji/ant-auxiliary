@@ -1,6 +1,6 @@
 
-use core::result::Result;
-use defmt::{ info, warn, Format };
+use core::{result::Result, u32};
+use defmt::{ info, Format };
 
 use futures::{select_biased, FutureExt};
 use rtic_monotonics::Monotonic;
@@ -10,7 +10,7 @@ use stm32f4xx_hal::{ gpio::{ Edge, ExtiPin }, pac::EXTI, syscfg::SysCfg};
 
 
 #[derive(Clone, Copy, Format)]
-struct Packet(u8, [u8;5]);
+pub struct Packet(u8, [u8;5]);
 
 impl Packet {
     const FIRST: u8 = 40; // MSB first: network data order
@@ -66,18 +66,26 @@ edge and the previous one gets measured. The interrupt handler waits
 for an interval that corresponds to a 'response' of ~160uS. Then
 it transitions into the Data state. In the data state, there's a fixed
 low of 50uS, followed by a high of 26-28uS for a 0, or 70uS for a 1,
-so this looks for an interval of ~80uS or ~120uS respectively
+so this looks for an interval of ~77uS or ~120uS respectively
  */
 #[derive(Clone, Copy, Format)]
-enum InputState {
+pub enum InputState {
     Standby,
-    Data(Packet)
+    Data(Packet),
+    Error
 }
 
+#[derive(Clone, Copy, Format)]
+pub enum ReadError {
+    Checksum,
+    Timeout,
+    Timing(InputState, u32),
+    Busy
+}
 pub struct Dht11Writer<'a, PIN: ExtiPin> {
     timestamp: u32,
     state: InputState,
-    writer: SignalWriter<'a, Packet>,
+    writer: SignalWriter<'a, Result<Packet, ReadError>>,
     pin: PIN,
     buckets: [u16;20]
 }
@@ -85,11 +93,12 @@ pub struct Dht11Writer<'a, PIN: ExtiPin> {
 struct DurationRange {
     min: u32,
     max: u32,
+    med: u32,
 }
 
 impl DurationRange {
     const fn micros(min: u32, max: u32) -> Self {
-        DurationRange { min, max }
+        DurationRange { min, max, med: (min+max)/2 }
     }
 
     fn contains(self, value: u32) -> bool {
@@ -99,10 +108,8 @@ impl DurationRange {
 
 const TIMEOUT: Duration = Duration::micros(2*(160 + 40*120));
 const INITIATE: u32 = 18000;
-const RESPONSE: DurationRange = DurationRange::micros(150, 170);
+const RESPONSE: DurationRange = DurationRange::micros(150, 180);
 const DATA: DurationRange = DurationRange::micros(50, 150);
-const DATA_VALUE: u32 = 100;
-
 
 impl <'a, PIN: ExtiPin> Dht11Writer<'a, PIN> {
     // call on a falling edge.
@@ -110,10 +117,14 @@ impl <'a, PIN: ExtiPin> Dht11Writer<'a, PIN> {
     // That is suprisingly high, but it's only half as long as the shortest
     // time between falling edges, so there's still some point in making
     // this interrupt driven.
+    #[link_section = ".data"]
+    #[inline(never)]
     pub fn edge(&mut self) {
 
-        let now = Mono::now().duration_since_epoch().to_micros() as u32;
-        let interval = now - self.timestamp;
+        let now = Mono::now().ticks() as u32;
+        // deal with wrapping
+        let interval = if now < self.timestamp { u32::MAX - self.timestamp + now } else  { now - self.timestamp };
+
         let bucket = (interval/10) as usize;
         if bucket < 20 {
             self.buckets[bucket] += 1;
@@ -127,42 +138,41 @@ impl <'a, PIN: ExtiPin> Dht11Writer<'a, PIN> {
         self.pin.clear_interrupt_pending_bit();
 
     }
-
+    
+    #[link_section = ".data"]
+    #[inline(never)]
     fn updated(&mut self, interval: u32, initial: InputState) -> InputState {
         use InputState::*;
 
         match initial {
             // Either this is initiate, or the interval between reads
-            Standby if interval > INITIATE => Standby,
+            Error | Standby if interval > INITIATE => Standby,
             Standby if RESPONSE.contains(interval) => Data(Packet::new()),
             Data(mut packet)  if DATA.contains(interval) => {
-                packet.append(interval > DATA_VALUE);
+                let value = interval > DATA.med;
+                packet.append(value);
                 if packet.complete() {
-                    self.writer.write(packet);
+                    self.writer.write(Result::Ok(packet));
                     Standby
                 } else {
                     Data(packet)
                 }
             },
-            _ => {
-                warn!("unexpected interval {}", interval);
-                Standby
-            }
+            Standby | Data(_) => {
+                self.writer.write(Result::Err(ReadError::Timing(initial, interval)));
+                Error
+            },
+            Error => Error,
         }
     }   
 }
 
 
-#[derive(Clone, Copy, Format)]
-pub enum ReadError {
-    Checksum,
-    Timeout,
-    Busy
-}
+
 
 
 pub struct Dht11Reader<'a, PIN> {
-    reader: SignalReader<'a, Packet>,
+    reader: SignalReader<'a, Result<Packet, ReadError>>,
     pin: Option<PIN>,
 }
 
@@ -176,7 +186,10 @@ where PIN: ExtiPin + InputPin + OutputPin {
                 Mono::delay(Duration::millis(20)).await;
                 pin.set_high().unwrap();
                 let result = select_biased! {
-                    packet = self.reader.wait_fresh().fuse() => packet.decode(),
+                    result = self.reader.wait_fresh().fuse() => match result {
+                        Result::Ok(packet) => packet.decode(),
+                        Result::Err(err) => Result::Err(err),
+                    },
                     _ = Mono::delay(TIMEOUT).fuse() => Result::Err(ReadError::Timeout),
                 };
                 self.pin.replace(pin);
@@ -196,7 +209,7 @@ pub fn make<PIN: ExtiPin + OutputPin, ALTPIN: ExtiPin>(
         syscfg: &mut SysCfg, 
         exti: &mut EXTI) -> (Dht11Writer<'static, ALTPIN>, Dht11Reader<'static, PIN>)
 {
-    let (writer, reader) = make_signal!(Packet);
+    let (writer, reader) = make_signal!(Result<Packet, ReadError>);
 
     let mut io = pin;
     io.make_interrupt_source(syscfg);
