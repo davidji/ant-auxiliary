@@ -3,14 +3,15 @@
 #![no_std]
 #[allow(non_snake_case)]
 
+mod dht11;
 mod fan;
 mod frequency;
+mod light;
 mod network;
-mod dht11;
 mod seed;
 mod shell;
 mod serial;
-mod temp;
+mod statistics;
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -36,6 +37,7 @@ use stm32f4xx_hal::{
         OpenDrain,
     }, 
     prelude::*,
+    pac::{ TIM3 },
     rcc,
     otg_fs::{UsbBus, UsbBusType, USB}
 };
@@ -61,6 +63,7 @@ impl frequency::Value<Duration, u32> for Duration {}
 
 const CHANNEL_CAPACITY: usize = 2*network::MTU as usize;
 const CHANNELS: usize = 2;
+const SOCKETS: usize = CHANNELS + 1; // +1 for the dhcp socket
 
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [ EXTI4, EXTI9_5, EXTI15_10 ])]
 mod app {
@@ -74,18 +77,17 @@ mod app {
     };
     use rtic_sync::{
         make_channel, 
-        make_signal, 
-        signal::{ Signal }
+        make_signal,
     };
 
-    use stm32f4xx_hal::{adc::{config::AdcConfig, Adc} };
+    use stm32f4xx_hal::{adc::{config::AdcConfig, Adc}, timer::PwmChannel };
 
     use crate::{ 
         frequency::{ Bounds, Frequency, Ratio }, 
-        network::SendChannel, proto::{TempRequest, TempResponse}, shell::TaskResponses,
+        network::SendChannel, proto::{LightRequest, TempRequest, TempResponse}, shell::TaskResponses,
     };
 
-    use defmt::{ debug, info, warn };
+    use defmt::{ debug, warn };
 
     use super::*;
 
@@ -112,8 +114,9 @@ mod app {
         requests: shell::CommandRequests<'static, CHANNEL_CAPACITY>,
         responses: shell::CommandResponses<'static, CHANNEL_CAPACITY>,
         network_send: [SendChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
-        fan: fan::Fan<'static>,
+        fan: fan::Fan<'static, PwmChannel<TIM3, 0>>,
         fan_freq: Frequency<'static, PA1<Input>, Mono, u32>,
+        light: light::Light<PwmChannel<TIM3, 1>>,
         led: PC13<Output>,
         temp_reader: dht11::Dht11Reader<'static, PA2<Output<OpenDrain>>>,
         temp_writer: dht11::Dht11Writer<'static, PC2>,
@@ -129,7 +132,7 @@ mod app {
         shell_channel_storage: NetworkChannelStorage<CHANNEL_CAPACITY> = NetworkChannelStorage::new(),
         ethernet_in_buffer: [u8; 2048] = [0; 2048],
         ethernet_out_buffer: [u8; 2048] = [0; 2048],
-        socket_storage: [SocketStorage<'static>; CHANNELS] = [SocketStorage::EMPTY; CHANNELS]])]
+        socket_storage: [SocketStorage<'static>; SOCKETS] = [SocketStorage::EMPTY; SOCKETS]])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
         let mut peripherals = cx.device;
@@ -164,7 +167,6 @@ mod app {
             pin_dp: usb_dp.into(),
             hclk: clocks.hclk(),
         }, cx.local.ep_memory));
-    
         
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
     
@@ -191,10 +193,11 @@ mod app {
 
         let (fan_freq_writer, fan_freq_reader) = make_signal!(Duration);
 
-        let (_, (fan_pwm, ..)) = peripherals.TIM3.pwm_hz(25.kHz(), &clocks);
+        let (_, (fan_pwm, light_pwm, ..)) = peripherals.TIM3.pwm_hz(25.kHz(), &clocks);
         let mut fan_pwm = fan_pwm.with(gpioa.pa6);
+        let mut light_pwm = light_pwm.with(gpioa.pa7);
         fan_pwm.enable();
-
+        light_pwm.enable();
 
         let mut syscfg = peripherals.SYSCFG.constrain();
         let fan_freq = Frequency::new(
@@ -241,13 +244,8 @@ mod app {
                 sender: shell_channel.app.send,
                 messages: response_receiver,
             },
-            fan: fan::Fan {
-                pwm: shell::TaskResponses { 
-                    task: fan_pwm, 
-                    responses: response_sender.clone()
-                },
-                freq_reader: fan_freq_reader,
-            },
+            fan: fan::Fan::new(fan_pwm, response_sender.clone(), fan_freq_reader),
+            light: light::Light::new(light_pwm, response_sender.clone()),
             fan_freq,
             led: gpioc.pc13.into_push_pull_output(),
             temp_reader,
@@ -267,7 +265,7 @@ mod app {
         }
     }
 
-    #[task(binds = OTG_FS, shared = [ usb, network ], local = [ network_recv ], priority=1)]
+    #[task(binds = OTG_FS, shared = [ usb, network ], local = [ network_recv ], priority=2)]
     fn usb_recv(cx: usb_recv::Context) {
         let channels = cx.local.network_recv;
         let mut shared = (cx.shared.usb, cx.shared.network);
@@ -279,7 +277,7 @@ mod app {
         });
     }
 
-    #[task(shared = [ usb, network ], local = [ network_send ])]
+    #[task(shared = [ usb, network ], local = [ network_send ], priority=2)]
     async fn usb_send(cx: usb_send::Context) {
         let channels = cx.local.network_send;
         let mut shared = (cx.shared.usb, cx.shared.network);
@@ -290,7 +288,7 @@ mod app {
                 network.try_send(channels);
             });
 
-            Mono::delay(1.millis().into()).await;
+            Mono::delay(500.micros().into()).await;
         }
     }
 
@@ -319,6 +317,9 @@ mod app {
                 Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
                     let _  = temp_request::spawn(request);
                 },
+                Request { peripheral: Some(RequestPeripheral::Light(request)) } => {
+                    let _ = light_request::spawn(request);
+                },
                 Request { peripheral: None } => {
                     warn!("No peripheral specified")
                 }
@@ -337,12 +338,11 @@ mod app {
     #[task(local=[temp_reader], shared=[temp])]
     async fn temp(mut cx: temp::Context) {
         let temp = cx.local.temp_reader;
-        Mono::delay(Duration::secs(10)).await;
+        Mono::delay(Duration::secs(1)).await;
         loop {
             let start = Mono::now();
             match temp.read().await {
                 Ok(response) => {
-                    info!("temperature: {}C, humidity: {}%", response.degrees_c, response.humidity);
                     cx.shared.temp.lock(|current| {
                         current.replace(response)
                     });
@@ -351,7 +351,7 @@ mod app {
                     warn!("Error reading temperature {}", err);
                 }
             }
-            Mono::delay_until(start + Duration::secs(10)).await;
+            Mono::delay_until(start + Duration::secs(1)).await;
         }
     }
 
@@ -366,10 +366,8 @@ mod app {
 
 
     #[task(binds=EXTI2, local=[temp_writer], priority=4)]
-    #[inline(never)]
-    #[link_section = ".data.temp_edge"]
-    fn temp_edge(cx: temp_edge::Context) {
-        cx.local.temp_writer.edge();
+    fn temp_falling_edge(cx: temp_falling_edge::Context) {
+        cx.local.temp_writer.falling_edge();
     }
 
     #[task(local=[fan])]
@@ -380,6 +378,11 @@ mod app {
     #[task(binds = EXTI1, local = [fan_freq])]
     fn fan_freq_edge(cx: fan_freq_edge::Context) {
         cx.local.fan_freq.edge();
+    }
+
+    #[task(local = [light])]
+    async fn light_request(cx: light_request::Context, request: LightRequest) {
+        cx.local.light.process(request).await;       
     }
 }
 

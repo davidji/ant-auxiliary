@@ -5,13 +5,25 @@ I need
 
  - A USB to serial adapter
  - Fan PWM control
- - OneWire temperature sensor monitoring
+ - DHT11 temperature sensor monitoring
  - Fan and spindle RPM monitoring
 
-I have a STM32F411 WeAct Black Pill V2, which should be able to do all that, so this project
-is to write a firmware that can do the above on it.
+I have a STM32F411 WeAct Black Pill V2, which should be able to do all that.
 
-I've gone for Rust and RTIC. When I first started messing around with embedded Rust,
-I was impressed by how joined up it all was. It's a bit messier at the moment -
-the splitting out of embedded-io and embedded-nb is not something the various
-hals have cought up with just yet, but I suspect that's temporary.
+The firmware is built in Rust and RTIC, so the various tasks can run independently.
+To avoid designing a protocol that combines serial with RPC, the interface is
+TCP/IP - with separate serial and RPC services.
+
+## DHT11
+
+The DHT11 turns out to be complicated: there are existing client libraries, but they contain a critical section that lasts for the whole reading, of about 4ms. This project includes an RTIC based
+client that handles EXTI interrupts, and uses the monotonic timer to timestamp the interrupts,
+calculating the value from intervals between the timestamps.
+
+The Hardware is actually capable of capturing the clock value on a falling edge and
+using DMA to do so repeatedly, so there's no need to handle an interrupt for each falling
+edge. The HAL doesn't support that though, and this works reliably with sufficiently low
+overhead, provided you turn on optimisation.
+
+## Regenerating protobuf/python
+

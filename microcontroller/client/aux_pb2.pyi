@@ -17,8 +17,8 @@ class FanRequest(_message.Message):
     class Set(_message.Message):
         __slots__ = ("duty",)
         DUTY_FIELD_NUMBER: _ClassVar[int]
-        duty: int
-        def __init__(self, duty: _Optional[int] = ...) -> None: ...
+        duty: float
+        def __init__(self, duty: _Optional[float] = ...) -> None: ...
     class Get(_message.Message):
         __slots__ = ()
         def __init__(self) -> None: ...
@@ -41,13 +41,17 @@ class FanResponse(_message.Message):
     __slots__ = ("duty", "rpm")
     DUTY_FIELD_NUMBER: _ClassVar[int]
     RPM_FIELD_NUMBER: _ClassVar[int]
-    duty: int
+    duty: float
     rpm: int
-    def __init__(self, duty: _Optional[int] = ..., rpm: _Optional[int] = ...) -> None: ...
+    def __init__(self, duty: _Optional[float] = ..., rpm: _Optional[int] = ...) -> None: ...
 
 class TempResponse(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
+    __slots__ = ("temperature_celsius", "humidity_percent")
+    TEMPERATURE_CELSIUS_FIELD_NUMBER: _ClassVar[int]
+    HUMIDITY_PERCENT_FIELD_NUMBER: _ClassVar[int]
+    temperature_celsius: float
+    humidity_percent: float
+    def __init__(self, temperature_celsius: _Optional[float] = ..., humidity_percent: _Optional[float] = ...) -> None: ...
 
 class Response(_message.Message):
     __slots__ = ("fan", "temp")

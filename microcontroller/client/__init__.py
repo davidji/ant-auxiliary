@@ -26,7 +26,7 @@ class AuxClient:
 
     def fan_set_duty(self, duty: float):
         request = aux.Request()
-        request.fan.set.duty = int(0xffff*duty)
+        request.fan.set.duty = duty
         self.send(request)
 
     def temp(self):

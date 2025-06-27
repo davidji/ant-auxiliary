@@ -4,12 +4,26 @@ message Request {
     oneof peripheral {
         FanRequest fan = 1;
         TempRequest temp = 2;
+        LightRequest light = 3;
     }
 }
 
 message FanRequest {
     message Set {
-        int32 duty = 1;
+        float duty = 1;
+    }
+
+    message Get { }
+
+    oneof command {
+        Get get = 1;
+        Set set = 2;
+    }
+}
+
+message LightRequest {
+    message Set {
+        float duty = 1;
     }
 
     message Get { }
@@ -29,18 +43,23 @@ message TempRequest {
 }
 
 message FanResponse {
-    int32 duty = 1;
+    float duty = 1;
     int32 rpm = 2;
 }
 
+message LightResponse {
+    float duty = 1;
+}
+
 message TempResponse {
-    int32 degrees_c = 1;
-    int32 humidity = 2;
+    float temperature_celsius = 1;
+    float humidity_percent = 2;
 }
 
 message Response {
     oneof peripheral {
        FanResponse fan = 1;
        TempResponse temp = 2;
+       LightResponse light = 3;
     }
 }

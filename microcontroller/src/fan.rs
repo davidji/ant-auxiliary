@@ -6,30 +6,43 @@ use crate::{
         Response, 
         Response_::Peripheral as ResponsePeripheral,
     },
-    shell,
+    shell::{ ResponseSender},
 };
 
 use defmt::{ debug, info, warn };
-use stm32f4xx_hal::{
-    pac::TIM3,
-    timer::PwmChannel, 
-};
+use embedded_hal::pwm::SetDutyCycle;
 
 use rtic_sync::signal::SignalReader;
 
 use crate::fugit::Rate;
 
-pub struct Fan<'a> {
-    pub pwm: shell::TaskResponses<PwmChannel<TIM3, 0>>,
-    pub freq_reader: SignalReader<'a, crate::Duration>,
+pub struct Fan<'a, PWM: SetDutyCycle> {
+    pwm: PWM,
+    responses: ResponseSender,
+    freq_reader: SignalReader<'a, crate::Duration>,
+    curent_duty: f32,
 }
 
-impl <'a> Fan<'a> {
+impl <'a, PWM: SetDutyCycle> Fan<'a, PWM> {
+    pub fn new(
+        pwm: PWM,
+        responses: ResponseSender,
+        freq_reader: SignalReader<'a, crate::Duration>,
+    ) -> Self {
+        Fan {
+            pwm,
+            responses,
+            freq_reader,
+            curent_duty: 0.0,
+        }
+    }
+
     pub async fn process(&mut self, request: FanRequest) {
        match request {
             FanRequest { command: Some(FanRequest_::Command::Set(set)) } => {
                 info!("fan set duty {}", set.duty);
-                self.pwm.task.set_duty(set.duty as u16);
+                self.pwm.set_duty_cycle((set.duty*self.pwm.max_duty_cycle() as f32) as u16).unwrap();
+                self.curent_duty = set.duty;
             },
             FanRequest { command: Some(FanRequest_::Command::Get(_)) } => { },
             FanRequest { command: _ } => {
@@ -38,12 +51,12 @@ impl <'a> Fan<'a> {
         }
 
         let response = self.response();
-        self.pwm.responses.send(response).await.unwrap();
+        self.responses.send(response).await.unwrap();
     }
 
     fn response(&mut self) -> Response {
         Response { peripheral: Some(ResponsePeripheral::Fan(FanResponse {
-            duty: self.pwm.task.get_duty() as i32,
+            duty: self.curent_duty,
             rpm: self.rpm(),
         })) }
     }

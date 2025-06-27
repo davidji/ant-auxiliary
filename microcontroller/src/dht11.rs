@@ -1,13 +1,14 @@
 
 use core::{result::Result, u32};
-use defmt::{ info, Format };
+use defmt::{ debug, error, Format };
 
 use futures::{select_biased, FutureExt};
 use rtic_monotonics::Monotonic;
-use rtic_sync::{make_signal, signal::{ Signal, SignalReader, SignalWriter }};
+use rtic_sync::{make_signal, signal::{ SignalReader, SignalWriter }};
 use embedded_hal::digital::{ InputPin, OutputPin };
-use stm32f4xx_hal::{ gpio::{ Edge, ExtiPin }, pac::EXTI, syscfg::SysCfg};
+use stm32f4xx_hal::{ gpio::{ Edge, ExtiPin }, pac::{ EXTI }, syscfg::SysCfg};
 
+use crate::statistics::StatsAccumulator;
 
 #[derive(Clone, Copy, Format)]
 pub struct Packet(u8, [u8;5]);
@@ -31,17 +32,17 @@ impl Packet {
     }
 
     fn decode(self) -> Result<TempResponse, ReadError> {
-        let humidity = self.word_n(3);
-        let temperature = self.word_n(1);
+        let humidity_percent = self.byte_n(3) as f32 + (self.byte_n(4) as f32 / 10.0);
+        let temperature_celsius = self.word_n(1) as f32 + (self.byte_n(2) as f32 / 10.0);
         let crc = self.1[4]
             .wrapping_add(self.1[3])
             .wrapping_add(self.1[2])
             .wrapping_add(self.1[1]);
 
         if crc == self.1[0] {
-            Result::Ok(TempResponse { degrees_c: temperature as i32, humidity: humidity as i32 })        
+            Result::Ok(TempResponse { temperature_celsius, humidity_percent })        
         } else {
-            info!("checksum {} != {} for {}", crc, self.1[0], self.1);
+            error!("checksum {} != {} for {}", crc, self.1[0], self.1);
             Result::Err(ReadError::Checksum)
         }
     }
@@ -82,12 +83,21 @@ pub enum ReadError {
     Timing(InputState, u32),
     Busy
 }
+
+#[derive(Clone, Copy, Format)]
+pub struct Statistics {
+    pub interrupt: StatsAccumulator<u32,f32>,
+    pub response: StatsAccumulator<u32,f32>,
+    pub zero: StatsAccumulator<u32,f32>,
+    pub one: StatsAccumulator<u32,f32>,
+}
+
 pub struct Dht11Writer<'a, PIN: ExtiPin> {
     timestamp: u32,
     state: InputState,
-    writer: SignalWriter<'a, Result<Packet, ReadError>>,
+    writer: SignalWriter<'a, (Statistics, Result<Packet, ReadError>)>,
     pin: PIN,
-    buckets: [u16;20]
+    statistics: Statistics,
 }
 
 struct DurationRange {
@@ -113,66 +123,61 @@ const DATA: DurationRange = DurationRange::micros(50, 150);
 
 impl <'a, PIN: ExtiPin> Dht11Writer<'a, PIN> {
     // call on a falling edge.
-    // This seems to have an execution time of 30uS - I.e. 3K clock cycles.
-    // That is suprisingly high, but it's only half as long as the shortest
-    // time between falling edges, so there's still some point in making
-    // this interrupt driven.
-    #[link_section = ".data"]
-    #[inline(never)]
-    pub fn edge(&mut self) {
+    // This is called at ~100uS intervals, so it needs to take much less than that to execute.
+    // The execution time with opt-level = 2 or "s" is ~4uS, and works reliably. 
+    // opt-level = 0 does not work.
+    pub fn falling_edge(&mut self) {
 
-        let now = Mono::now().ticks() as u32;
+        let before = Mono::now().ticks() as u32;
         // deal with wrapping
-        let interval = if now < self.timestamp { u32::MAX - self.timestamp + now } else  { now - self.timestamp };
+        let interval = if before < self.timestamp { u32::MAX - self.timestamp + before } else  { before - self.timestamp };
 
-        let bucket = (interval/10) as usize;
-        if bucket < 20 {
-            self.buckets[bucket] += 1;
-        }
-        self.timestamp = now;
+        self.timestamp = before;
         let initial = self.state;
         self.state = self.updated(interval, initial);
 
-        // debug!("transition {} => {}", initial, self.state);
+        let after = Mono::now().ticks() as u32;
+        self.statistics.interrupt.add((after - before) as f32);
 
         self.pin.clear_interrupt_pending_bit();
 
     }
     
-    #[link_section = ".data"]
-    #[inline(never)]
     fn updated(&mut self, interval: u32, initial: InputState) -> InputState {
         use InputState::*;
 
         match initial {
             // Either this is initiate, or the interval between reads
             Error | Standby if interval > INITIATE => Standby,
-            Standby if RESPONSE.contains(interval) => Data(Packet::new()),
+            Standby if RESPONSE.contains(interval) => {
+                self.statistics.response.add(interval as f32);
+                Data(Packet::new())
+            },
             Data(mut packet)  if DATA.contains(interval) => {
                 let value = interval > DATA.med;
+                if value { &mut self.statistics.one } else { &mut self.statistics.zero }.add(interval as f32);
                 packet.append(value);
                 if packet.complete() {
-                    self.writer.write(Result::Ok(packet));
+                    self.writer.write((self.statistics, Result::Ok(packet)));
                     Standby
                 } else {
                     Data(packet)
                 }
             },
             Standby | Data(_) => {
-                self.writer.write(Result::Err(ReadError::Timing(initial, interval)));
+                self.writer.write((self.statistics, Result::Err(ReadError::Timing(initial, interval))));
                 Error
             },
             Error => Error,
         }
-    }   
+    }
+
 }
 
 
 
-
-
 pub struct Dht11Reader<'a, PIN> {
-    reader: SignalReader<'a, Result<Packet, ReadError>>,
+    reader: SignalReader<'a, (Statistics, Result<Packet, ReadError>)>,
     pin: Option<PIN>,
 }
 
@@ -186,9 +191,12 @@ where PIN: ExtiPin + InputPin + OutputPin {
                 Mono::delay(Duration::millis(20)).await;
                 pin.set_high().unwrap();
                 let result = select_biased! {
-                    result = self.reader.wait_fresh().fuse() => match result {
-                        Result::Ok(packet) => packet.decode(),
-                        Result::Err(err) => Result::Err(err),
+                    (statistics, result) = self.reader.wait_fresh().fuse() => {
+                        debug!("statistics: {}", statistics);
+                        match result {
+                            Result::Ok(packet) => packet.decode(),
+                            Result::Err(err) => Result::Err(err),
+                        }
                     },
                     _ = Mono::delay(TIMEOUT).fuse() => Result::Err(ReadError::Timeout),
                 };
@@ -209,7 +217,8 @@ pub fn make<PIN: ExtiPin + OutputPin, ALTPIN: ExtiPin>(
         syscfg: &mut SysCfg, 
         exti: &mut EXTI) -> (Dht11Writer<'static, ALTPIN>, Dht11Reader<'static, PIN>)
 {
-    let (writer, reader) = make_signal!(Result<Packet, ReadError>);
+    let (writer, reader) = 
+        make_signal!((Statistics, Result<Packet, ReadError>));
 
     let mut io = pin;
     io.make_interrupt_source(syscfg);
@@ -217,7 +226,18 @@ pub fn make<PIN: ExtiPin + OutputPin, ALTPIN: ExtiPin>(
     io.enable_interrupt(exti);
     
     (
-        Dht11Writer { writer, timestamp: 0, state: InputState::Standby, pin: altpin, buckets: [0;20] },
+        Dht11Writer { 
+            writer, 
+            timestamp: 0, 
+            state: InputState::Standby, 
+            pin: altpin, 
+            statistics: Statistics {
+                interrupt: StatsAccumulator::new(),
+                zero: StatsAccumulator::new(),
+                one: StatsAccumulator::new(),
+                response: StatsAccumulator::new(), 
+            },
+        },
         Dht11Reader { reader, pin : Option::Some(io) },
     )
 }

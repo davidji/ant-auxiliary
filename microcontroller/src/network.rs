@@ -11,12 +11,15 @@ use usbd_ethernet::{ Ethernet, DeviceState };
 use usb_device::UsbError;
 
 use smoltcp::{
-    iface::{self, Interface, SocketHandle, SocketSet, SocketStorage }, socket::tcp,  time::Instant, wire::{ EthernetAddress, Ipv4Address, Ipv4Cidr }
+    iface::{self, Interface, SocketHandle, SocketSet, SocketStorage }, 
+    socket::{ dhcpv4, tcp },  
+    time::Instant, 
+    wire::{ EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr }
 };
 
 use rtic_sync::channel::{ Channel, ReceiveError, Receiver, Sender, TrySendError};
 
-pub const IP_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
+pub const IP_ADDRESS: Ipv4Address = Ipv4Address::new(0, 0, 0, 0);
 const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
 pub const MTU: u16 = 64;
 
@@ -208,6 +211,7 @@ pub struct NetworkStack<'a, CLOCK: Monotonic> {
     pub ethernet: Ethernet<'a, UsbBus<USB>>,
     pub interface: Interface,
     pub sockets: SocketSet<'a>,
+    pub dhcp: SocketHandle,
     clock: PhantomData<CLOCK>,
 }
 
@@ -219,10 +223,14 @@ where CLOCK::Instant: IntoInstant {
         storage: &'a mut [SocketStorage<'a>],
         seed: u64) -> Self {
         let interface = Self::interface(&mut ethernet, seed);
+        let dhcp_socket = dhcpv4::Socket::new();
+        let mut sockets = SocketSet::new(storage);
+        let dhcp = sockets.add(dhcp_socket);
         NetworkStack::<'a,CLOCK> {
             ethernet,
             interface,
-            sockets:SocketSet::new(storage),
+            sockets,
+            dhcp,
             clock: PhantomData
         }
     }
@@ -291,6 +299,8 @@ where CLOCK::Instant: IntoInstant {
             iface::PollResult::None => false
         };
 
+        self.dhcp_poll();
+
         let mut ack = false;
         if data {
             for channel in channels {
@@ -302,7 +312,41 @@ where CLOCK::Instant: IntoInstant {
             self.interface.poll_egress(Self::now(), &mut self.ethernet, &mut self.sockets);
         }
     }
-   
+
+    fn dhcp_poll(&mut self) {
+        let event = self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll();
+        match event {
+            None => {}
+            Some(dhcpv4::Event::Configured(config)) => {
+                debug!("DHCP config acquired!");
+
+                debug!("IP address:      {}", config.address);
+                self.interface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    addrs.push(IpCidr::Ipv4(config.address)).unwrap();
+                });
+
+                if let Some(router) = config.router {
+                    debug!("Default gateway: {}", router);
+                    self.interface.routes_mut().add_default_ipv4_route(router).unwrap();
+                } else {
+                    debug!("Default gateway: None");
+                    self.interface.routes_mut().remove_default_ipv4_route();
+                }
+
+                for (i, s) in config.dns_servers.iter().enumerate() {
+                    debug!("DNS server {}:    {}", i, s);
+                }
+            }
+            Some(dhcpv4::Event::Deconfigured) => {
+                debug!("DHCP lost config!");
+                self.interface.update_ip_addrs(|addrs| addrs.clear());
+                self.interface.routes_mut().remove_default_ipv4_route();
+            }
+        }
+
+    }
+
     pub fn channel<const N:usize>(&mut self, port: u16, storage: &'a mut NetworkChannelStorage<N>) -> NetworkChannel<'a, N> {
         let rx_buffer = tcp::SocketBuffer::new(&mut storage.rx_storage[..]);
         let tx_buffer = tcp::SocketBuffer::new(&mut storage.tx_storage[..]);
