@@ -1,11 +1,14 @@
 use rtic_monotonics::Monotonic;
+use sha2::{Digest, Sha256};
 use core::{future::poll_fn, marker::PhantomData};
 
 use futures::task::Poll;
 
 use defmt::{ debug, error, info, warn };
 
-use stm32f4xx_hal::otg_fs::{ UsbBus, USB };
+use stm32f4xx_hal::{
+    otg_fs::{ UsbBus, USB }
+};
 
 use usbd_ethernet::{ Ethernet, DeviceState };
 use usb_device::UsbError;
@@ -14,23 +17,40 @@ use smoltcp::{
     iface::{self, Interface, SocketHandle, SocketSet, SocketStorage }, 
     socket::{ dhcpv4, tcp },  
     time::Instant, 
-    wire::{ EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr }
+    wire::{ DhcpOption, EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr }
 };
 
 use rtic_sync::channel::{ Channel, ReceiveError, Receiver, Sender, TrySendError};
 
 pub const IP_ADDRESS: Ipv4Address = Ipv4Address::new(0, 0, 0, 0);
-const DEVICE_MAC_ADDR: [u8; 6] = [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC];
 pub const MTU: u16 = 64;
+
+pub fn mac_address(seed: &str) -> [u8; 6] {
+    let uid = stm32f4xx_hal::signature::Uid::get();
+    let mut digest = Sha256::new();
+    digest.update(seed.as_bytes());
+    digest.update(uid.lot_num());
+    digest.update(&uid.waf_num().to_le_bytes());
+    digest.update(&uid.x().to_be_bytes());
+    digest.update(&uid.y().to_le_bytes());
+    let hash = digest.finalize();
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&hash[0..6]);
+    // Set the second-least-significant bit to indicate a locally administered address
+    mac[0] |= 0b00000010; 
+    mac
+}
 
 pub fn usb_ethernet<'a>(
     usb_alloc: &'a usb_device::bus::UsbBusAllocator<UsbBus<USB>>,
     in_buffer: &'a mut [u8; 2048],
     out_buffer: &'a mut [u8; 2048]) ->  Ethernet<'a, UsbBus<USB>> {
 
+    let mac_address = mac_address("interface");
+    info!("interface MAC address: {}", EthernetAddress(mac_address));
     Ethernet::new(
         usb_alloc,
-        DEVICE_MAC_ADDR,
+        mac_address,
         MTU,
         in_buffer,
         out_buffer)
@@ -104,7 +124,7 @@ impl <const N: usize> RecvChannel<'_, N> {
                     true => (RecvChannelState::Closing, false),
                     false => {
                         info!("socket closed, state {}, listenning on {}", socket.state(), self.port);
-                        socket.listen((IP_ADDRESS, self.port)).ok();
+                        socket.listen(self.port).ok();
                         (RecvChannelState::Listening, false)
                     }
                 }
@@ -219,11 +239,13 @@ impl <'a, CLOCK: Monotonic> NetworkStack<'a, CLOCK>
 where CLOCK::Instant: IntoInstant {
 
     pub fn new(
+        options:&'static [DhcpOption<'static>],
         mut ethernet: Ethernet<'a, UsbBus<USB>>,
         storage: &'a mut [SocketStorage<'a>],
         seed: u64) -> Self {
         let interface = Self::interface(&mut ethernet, seed);
-        let dhcp_socket = dhcpv4::Socket::new();
+        let mut dhcp_socket = dhcpv4::Socket::new();
+        dhcp_socket.set_outgoing_options(options);
         let mut sockets = SocketSet::new(storage);
         let dhcp = sockets.add(dhcp_socket);
         NetworkStack::<'a,CLOCK> {
@@ -236,7 +258,8 @@ where CLOCK::Instant: IntoInstant {
     }
 
     fn interface(ethernet: &mut Ethernet<'a, UsbBus<USB>>, seed: u64) -> Interface {
-        let mut interface_config = iface::Config::new(EthernetAddress(DEVICE_MAC_ADDR).into());
+        let mac_address = EthernetAddress(mac_address("device"));
+        let mut interface_config = iface::Config::new(mac_address.into());
         interface_config.random_seed = seed;
 
         let mut interface = Interface::new(
@@ -250,9 +273,9 @@ where CLOCK::Instant: IntoInstant {
                 .unwrap();
         });
 
+        info!("device MAC address: {}", mac_address);
         interface
     }
-
 
     pub fn connect(&mut self)  {
         if self.ethernet.state() == DeviceState::Disconnected {
@@ -320,7 +343,7 @@ where CLOCK::Instant: IntoInstant {
             Some(dhcpv4::Event::Configured(config)) => {
                 debug!("DHCP config acquired!");
 
-                debug!("IP address:      {}", config.address);
+                info!("IP address:      {}", config.address);
                 self.interface.update_ip_addrs(|addrs| {
                     addrs.clear();
                     addrs.push(IpCidr::Ipv4(config.address)).unwrap();
@@ -355,7 +378,7 @@ where CLOCK::Instant: IntoInstant {
         let handle = self.sockets.add(socket);
     
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-        socket.listen((IP_ADDRESS, port)).ok();
+        socket.listen(port).ok();
       
         let (net_send, app_recv) = storage.receiver.split();
         let (app_send, net_recv) = storage.sender.split();

@@ -40,5 +40,5 @@ class AuxClient:
         return MessageToJson(message, indent=2)
 
 async def connect() -> AuxClient:
-    (reader, writer) = await asyncio.open_connection("10.0.0.1", 1338)
+    (reader, writer) = await asyncio.open_connection("ant-auxiliary", 1338)
     return AuxClient(reader, writer)

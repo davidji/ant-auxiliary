@@ -50,7 +50,7 @@ use rtic_monotonics::{
 };
 
 use smoltcp::{
-    iface::{ SocketStorage },
+    iface::SocketStorage, wire::DhcpOption,
 };
 
 
@@ -64,6 +64,11 @@ impl frequency::Value<Duration, u32> for Duration {}
 const CHANNEL_CAPACITY: usize = 2*network::MTU as usize;
 const CHANNELS: usize = 2;
 const SOCKETS: usize = CHANNELS + 1; // +1 for the dhcp socket
+
+const DHCP_HOST_NAME: u8 = 12;
+const DHCP_OPTIONS: &[DhcpOption<'static>] = &[
+    DhcpOption { kind: DHCP_HOST_NAME, data: b"ant-auxiliary" },
+];
 
 #[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [ EXTI4, EXTI9_5, EXTI15_10 ])]
 mod app {
@@ -87,7 +92,7 @@ mod app {
         network::SendChannel, proto::{LightRequest, TempRequest, TempResponse}, shell::TaskResponses,
     };
 
-    use defmt::{ debug, warn };
+    use defmt::{ debug, info, warn };
 
     use super::*;
 
@@ -148,6 +153,9 @@ mod app {
 
         Mono::start(100_000_000);
 
+        let uid = stm32f4xx_hal::signature::Uid::get();
+        info!("UID: lot: {} wafer: {} x: {}, y: {}", uid.lot_num(), uid.waf_num(), uid.x(), uid.y());
+
         let gpioa = peripherals.GPIOA.split();
         let gpioc = peripherals.GPIOC.split();
 
@@ -168,14 +176,16 @@ mod app {
             hclk: clocks.hclk(),
         }, cx.local.ep_memory));
         
+
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
     
-        let usb_ethernet: usbd_ethernet::Ethernet<'_, UsbBus<USB>> = network::usb_ethernet(
+        let usb_ethernet = network::usb_ethernet(
             usb_bus, 
             cx.local.ethernet_in_buffer, 
             cx.local.ethernet_out_buffer);
 
         let mut network = NetworkStack::new(
+            DHCP_OPTIONS,
             usb_ethernet, 
             &mut cx.local.socket_storage[..],
             seed::seed(
