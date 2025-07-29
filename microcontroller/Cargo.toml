@@ -10,19 +10,19 @@ cortex-m-rt = "0.7"
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"
 
-embedded-hal = { version = "1.0.0" }
-embedded-hal-nb = { version = "1.0.0" }
+embedded-hal = "1.0.0"
+embedded-hal-nb = "1.0.0"
+embedded-io-async = "0.6.1"
 
 panic-probe = { version = "1.0.0", features = [ "print-defmt" ] }
 
-stm32f4xx-hal = { version = "0.22.1",  features = [ "usb_fs", "stm32f411", "defmt" ] }
+hal = { package = "stm32f4xx-hal", version = "0.22.1",  features = [ "usb_fs", "stm32f411", "defmt", "rtic2" ] }
 stm32-usbd = { version = "0.7.0" }
 
 cortex-m-semihosting = "0.5.0"
 rtic = { version = "2.2.0", features = [ "thumbv7-backend" ] }
-nb = "1.1.0"
+nb = { version = "1.1.0", dependencies = [ "defmt" ] }
 usb-device = "0.3.2"
-usbd-serial = "0.2.2"
 usbd-ethernet = { version = "0.4.0", features = [ "defmt" ] }
 rtic-monotonics = { version = "2.0.3", features = [ "stm32_tim2", "stm32-metapac", "stm32f411ce", "defmt" ]}
 rtic-sync = { version = "1.4.0", features = ["defmt-03" ]}

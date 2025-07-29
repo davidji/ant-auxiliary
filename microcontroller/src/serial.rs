@@ -1,4 +1,6 @@
-use stm32f4xx_hal::{
+
+use defmt::{ warn };
+use hal::{
     gpio::gpioa,
     pac,
     prelude::*,
@@ -42,12 +44,24 @@ pub struct RxTask<'a> {
     sender: Sender<'a, u8, CHANNEL_CAPACITY>,
 }
 
+
 impl <'a> RxTask<'a> {
     pub fn receive(&mut self) {
         while self.rx.is_rx_not_empty() {
             match self.rx.read() {
                 Ok(data) => self.sender.try_send(data).unwrap(),
-                Err(_) => panic!("Error reading from GRBL serial")
+                Err(WouldBlock) => { },
+                Err(nb::Error::Other(e)) => {
+                    warn!("Error reading from GRBL serial: {:?}", match e {
+                        serial::Error::Overrun=>"Overrun",
+                        serial::Error::Noise=>"Noise",
+                        serial::Error::Parity=>"Parity",
+                        serial::Error::FrameFormat=>"Framing",
+                        serial::Error::Other=>"Other",
+                        _ => "Unknown",
+                    });
+                    break;
+                }
             }
         }
     }
@@ -87,7 +101,7 @@ impl <'a> Tasks<'a> {
     tx: gpioa::PA9,
     rx: gpioa::PA10,
     clocks: rcc::Clocks,
-        channel: NetworkChannel<'a, CHANNEL_CAPACITY>) -> Tasks<'a> {
+    channel: NetworkChannel<'a, CHANNEL_CAPACITY>) -> Tasks<'a> {
 
         let (tx, mut rx) = grbl_serial(usart, tx, rx, clocks);
         rx.listen();

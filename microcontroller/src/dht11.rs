@@ -6,7 +6,7 @@ use futures::{select_biased, FutureExt};
 use rtic_monotonics::Monotonic;
 use rtic_sync::{make_signal, signal::{ SignalReader, SignalWriter }};
 use embedded_hal::digital::{ InputPin, OutputPin };
-use stm32f4xx_hal::{ gpio::{ Edge, ExtiPin }, pac::{ EXTI }, syscfg::SysCfg};
+use hal::{ gpio::{ Edge, ExtiPin }, pac::{ EXTI }, syscfg::SysCfg};
 
 use crate::statistics::StatsAccumulator;
 

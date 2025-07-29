@@ -9,9 +9,12 @@ mod frequency;
 mod light;
 mod network;
 mod seed;
-mod shell;
+mod codec;
 mod serial;
+mod shell;
 mod statistics;
+mod stream;
+mod channel_stream;
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -25,7 +28,8 @@ use panic_probe as _;
 use defmt_rtt as _;
 
 use cortex_m::asm::delay;
-use stm32f4xx_hal::{
+use hal::{
+    adc::{config::AdcConfig, Adc}, 
     gpio::{
         gpioa::{ PA1, PA2 }, 
         gpioc::{ 
@@ -38,8 +42,9 @@ use stm32f4xx_hal::{
     }, 
     prelude::*,
     pac::{ TIM3 },
+    otg_fs::{UsbBus, UsbBusType, USB},
     rcc,
-    otg_fs::{UsbBus, UsbBusType, USB}
+    timer::PwmChannel,
 };
 
 use usb_device::prelude::*;
@@ -70,9 +75,10 @@ const DHCP_OPTIONS: &[DhcpOption<'static>] = &[
     DhcpOption { kind: DHCP_HOST_NAME, data: b"ant-auxiliary" },
 ];
 
-#[rtic::app(device = stm32f4xx_hal::pac, dispatchers = [ EXTI4, EXTI9_5, EXTI15_10 ])]
+#[rtic::app(device = hal::pac, dispatchers = [ EXTI4, EXTI9_5, EXTI15_10 ])]
 mod app {
 
+    use micropb::MessageEncode;
     use proto::{ 
         FanRequest,
         Request, 
@@ -85,12 +91,28 @@ mod app {
         make_signal,
     };
 
-    use stm32f4xx_hal::{adc::{config::AdcConfig, Adc}, timer::PwmChannel };
-
     use crate::{ 
+        channel_stream::{ 
+            ChannelConsumer, 
+            ChannelSupplier }, 
+        codec, 
         frequency::{ Bounds, Frequency, Ratio }, 
-        network::SendChannel, proto::{LightRequest, TempRequest, TempResponse}, shell::TaskResponses,
+        network::SendChannel, 
+        proto::{ LightRequest, TempRequest, TempResponse },
+        shell::TaskResponses,
+        stream::{ Consumer, Supplier },
     };
+
+    const REQUEST_MAX_SIZE: usize = Request::MAX_SIZE.unwrap();
+    type RequestDecoder = codec::Decoder<
+        ChannelSupplier<'static, u8, CHANNEL_CAPACITY>, 
+        Request, 
+        REQUEST_MAX_SIZE>;
+    const RESPONSE_MAX_SIZE: usize = Response::MAX_SIZE.unwrap();
+    type ResponseEncoder = codec::Encoder<
+        Response,
+        ChannelConsumer<'static, u8, CHANNEL_CAPACITY>,
+        RESPONSE_MAX_SIZE>;
 
     use defmt::{ debug, info, warn };
 
@@ -116,8 +138,9 @@ mod app {
         grbl_tx: serial::TxTask<'static>, 
         grbl_rx: serial::RxTask<'static>,
         network_recv: [RecvChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
-        requests: shell::CommandRequests<'static, CHANNEL_CAPACITY>,
-        responses: shell::CommandResponses<'static, CHANNEL_CAPACITY>,
+        request_decoder: RequestDecoder,
+        response_receiver: ChannelSupplier<'static, Response, { shell::MESSAGE_CAPACITY }>,
+        response_encoder: ResponseEncoder,
         network_send: [SendChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
         fan: fan::Fan<'static, PwmChannel<TIM3, 0>>,
         fan_freq: Frequency<'static, PA1<Input>, Mono, u32>,
@@ -127,7 +150,6 @@ mod app {
         temp_writer: dht11::Dht11Writer<'static, PC2>,
         temp_responses: TaskResponses<()>,
     }
-    
 
 
     #[init(local=[
@@ -153,7 +175,7 @@ mod app {
 
         Mono::start(100_000_000);
 
-        let uid = stm32f4xx_hal::signature::Uid::get();
+        let uid = hal::signature::Uid::get();
         info!("UID: lot: {} wafer: {} x: {}, y: {}", uid.lot_num(), uid.waf_num(), uid.x(), uid.y());
 
         let gpioa = peripherals.GPIOA.split();
@@ -228,7 +250,7 @@ mod app {
 
         let (response_sender, 
              response_receiver) = make_channel!(
-                shell::Message, 
+                Response,
                 { shell::MESSAGE_CAPACITY });
 
         let (temp_writer, temp_reader) = dht11::make(
@@ -246,14 +268,9 @@ mod app {
             grbl_rx: grbl.rx,
             network_recv: [grbl.net.recv, shell_channel.net.recv],
             network_send : [grbl.net.send, shell_channel.net.send],
-            requests: shell::CommandRequests {
-                requests: shell_channel.app.recv,
-                responses: response_sender.clone()
-            },
-            responses: shell::CommandResponses {
-                sender: shell_channel.app.send,
-                messages: response_receiver,
-            },
+            response_receiver: ChannelSupplier::new(response_receiver),
+            request_decoder: codec::Decoder::new(ChannelSupplier::new(shell_channel.app.recv)),
+            response_encoder: codec::Encoder::new(ChannelConsumer::new(shell_channel.app.send)),
             fan: fan::Fan::new(fan_pwm, response_sender.clone(), fan_freq_reader),
             light: light::Light::new(light_pwm, response_sender.clone()),
             fan_freq,
@@ -317,30 +334,32 @@ mod app {
         }
     }
 
-    #[task(local = [requests])]
+    #[task(local = [request_decoder])]
     async fn requests(cx: requests::Context) {
+        let request_decoder = cx.local.request_decoder;
         loop {
-            match cx.local.requests.receive().await {
-                Request { peripheral: Some(RequestPeripheral::Fan(request)) } => {
+            match request_decoder.next().await {
+                Some(Request { peripheral: Some(RequestPeripheral::Fan(request)) }) => {
                     let _ = fan_request::spawn(request);
                 },
-                Request { peripheral: Some(RequestPeripheral::Temp(request)) } => {
+                Some(Request { peripheral: Some(RequestPeripheral::Temp(request)) }) => {
                     let _  = temp_request::spawn(request);
                 },
-                Request { peripheral: Some(RequestPeripheral::Light(request)) } => {
+                Some(Request { peripheral: Some(RequestPeripheral::Light(request)) }) => {
                     let _ = light_request::spawn(request);
                 },
-                Request { peripheral: None } => {
+                Some(Request { peripheral: None }) => {
                     warn!("No peripheral specified")
-                }
+                },
+                None => break,
             };
         }
     }
 
-    #[task(local = [responses])]
+    #[task(local = [response_encoder, response_receiver])]
     async fn responses(cx: responses::Context) {
         debug!("response relay starting");
-        cx.local.responses.send().await;
+        stream::relay(cx.local.response_receiver, cx.local.response_encoder).await.unwrap();
         debug!("response relay exit");
     }
 

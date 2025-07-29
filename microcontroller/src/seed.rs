@@ -1,4 +1,4 @@
-use stm32f4xx_hal::{
+use hal::{
   adc::{
     config::{SampleTime}, Adc
   }, gpio::{Analog, Pin}, pac::ADC1

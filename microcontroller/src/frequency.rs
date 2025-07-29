@@ -3,7 +3,7 @@ use defmt::{ trace };
 
 use rtic_monotonics::Monotonic;
 use rtic_sync::signal::{ SignalWriter };
-use stm32f4xx_hal::{ gpio::{ Edge, ExtiPin }, pac::EXTI, syscfg::SysCfg};
+use hal::{ gpio::{ Edge, ExtiPin }, pac::EXTI, syscfg::SysCfg};
 
 pub trait Proportion<P> : Add<P, Output = P> + Copy + Clone {}
 pub trait Value<V, P>: 

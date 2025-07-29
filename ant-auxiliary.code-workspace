@@ -5,6 +5,21 @@
 		},
 		{
 			"path": "microcontroller"
+		},
+		{
+			"path": "../nrf24l01-gateway"
+		},
+		{
+			"path": "../embedded-nrf24l01"
+		},
+		{
+			"path": "../../ferrous-systems/rust-exercises"
+		},
+		{
+			"path": "../../ferrous-systems/rust-exercises/nrf52-code/radio-app"
+		},
+		{
+			"path": "../nrf-hal"
 		}
 	],
 	"settings": {

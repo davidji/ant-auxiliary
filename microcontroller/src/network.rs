@@ -6,7 +6,7 @@ use futures::task::Poll;
 
 use defmt::{ debug, error, info, warn };
 
-use stm32f4xx_hal::{
+use hal::{
     otg_fs::{ UsbBus, USB }
 };
 
@@ -26,7 +26,7 @@ pub const IP_ADDRESS: Ipv4Address = Ipv4Address::new(0, 0, 0, 0);
 pub const MTU: u16 = 64;
 
 pub fn mac_address(seed: &str) -> [u8; 6] {
-    let uid = stm32f4xx_hal::signature::Uid::get();
+    let uid = hal::signature::Uid::get();
     let mut digest = Sha256::new();
     digest.update(seed.as_bytes());
     digest.update(uid.lot_num());

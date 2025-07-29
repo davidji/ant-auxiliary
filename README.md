@@ -14,6 +14,12 @@ The firmware is built in Rust and RTIC, so the various tasks can run independent
 To avoid designing a protocol that combines serial with RPC, the interface is
 TCP/IP - with separate serial and RPC services.
 
+This makes this a pretty good example:
+- [WeAct Black Pill v2](https://stm32-base.org/boards/STM32F411CEU6-WeAct-Black-Pill-V2.0.html) is cheap and easy to obtain
+- Uses latest versions of all it's dependencies
+- Protcol buffers means functionality can easily be added
+- Uses most of the features of RTIC
+
 ## DHT11
 
 The DHT11 turns out to be complicated: there are existing client libraries, but they contain a critical section that lasts for the whole reading, of about 4ms. This project includes an RTIC based
@@ -24,8 +30,6 @@ The Hardware is actually capable of capturing the clock value on a falling edge 
 using DMA to do so repeatedly, so there's no need to handle an interrupt for each falling
 edge. The HAL doesn't support that though, and this works reliably with sufficiently low
 overhead, provided you turn on optimisation.
-
-## Regenerating protobuf/python
 
 ## Networking
 
