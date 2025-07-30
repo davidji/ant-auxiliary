@@ -41,6 +41,7 @@ never = { version = "0.1.0", default-features = false }
 micromath = "2.1.0"
 fugit = "0.3.7"
 sha2 = { version="0.10.9", default-features = false }
+pbstreams = { package="embedded-pbstreams", path="../../embedded-pbstreams" }
 
 [build-dependencies]
 micropb-gen = "0.3.0"

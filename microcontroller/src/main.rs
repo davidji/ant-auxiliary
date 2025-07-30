@@ -9,12 +9,9 @@ mod frequency;
 mod light;
 mod network;
 mod seed;
-mod codec;
 mod serial;
 mod shell;
 mod statistics;
-mod stream;
-mod channel_stream;
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -91,27 +88,36 @@ mod app {
         make_signal,
     };
 
+    use pbstreams::{
+        codec,
+        stream::{
+            self, 
+            Stream,
+            channel::{ 
+                ChannelSink, 
+                ChannelStream 
+            },
+        },
+    };
+
     use crate::{ 
-        channel_stream::{ 
-            ChannelConsumer, 
-            ChannelSupplier }, 
-        codec, 
         frequency::{ Bounds, Frequency, Ratio }, 
         network::SendChannel, 
         proto::{ LightRequest, TempRequest, TempResponse },
         shell::TaskResponses,
-        stream::{ Consumer, Supplier },
     };
+
+
 
     const REQUEST_MAX_SIZE: usize = Request::MAX_SIZE.unwrap();
     type RequestDecoder = codec::Decoder<
-        ChannelSupplier<'static, u8, CHANNEL_CAPACITY>, 
+        ChannelStream<'static, u8, CHANNEL_CAPACITY>, 
         Request, 
         REQUEST_MAX_SIZE>;
     const RESPONSE_MAX_SIZE: usize = Response::MAX_SIZE.unwrap();
     type ResponseEncoder = codec::Encoder<
         Response,
-        ChannelConsumer<'static, u8, CHANNEL_CAPACITY>,
+        ChannelSink<'static, u8, CHANNEL_CAPACITY>,
         RESPONSE_MAX_SIZE>;
 
     use defmt::{ debug, info, warn };
@@ -139,7 +145,7 @@ mod app {
         grbl_rx: serial::RxTask<'static>,
         network_recv: [RecvChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
         request_decoder: RequestDecoder,
-        response_receiver: ChannelSupplier<'static, Response, { shell::MESSAGE_CAPACITY }>,
+        response_receiver: ChannelStream<'static, Response, { shell::MESSAGE_CAPACITY }>,
         response_encoder: ResponseEncoder,
         network_send: [SendChannel<'static, CHANNEL_CAPACITY>; CHANNELS],
         fan: fan::Fan<'static, PwmChannel<TIM3, 0>>,
@@ -268,9 +274,9 @@ mod app {
             grbl_rx: grbl.rx,
             network_recv: [grbl.net.recv, shell_channel.net.recv],
             network_send : [grbl.net.send, shell_channel.net.send],
-            response_receiver: ChannelSupplier::new(response_receiver),
-            request_decoder: codec::Decoder::new(ChannelSupplier::new(shell_channel.app.recv)),
-            response_encoder: codec::Encoder::new(ChannelConsumer::new(shell_channel.app.send)),
+            response_receiver: ChannelStream::new(response_receiver),
+            request_decoder: codec::Decoder::new(ChannelStream::new(shell_channel.app.recv)),
+            response_encoder: codec::Encoder::new(ChannelSink::new(shell_channel.app.send)),
             fan: fan::Fan::new(fan_pwm, response_sender.clone(), fan_freq_reader),
             light: light::Light::new(light_pwm, response_sender.clone()),
             fan_freq,

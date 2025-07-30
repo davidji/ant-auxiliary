@@ -1,24 +1,35 @@
 {
 	"folders": [
 		{
+			"name": "ant-auxiliary",
 			"path": "."
 		},
 		{
+			"name": "microcontroller",
 			"path": "microcontroller"
 		},
 		{
+			"name": "nrf24l01-gateway",
 			"path": "../nrf24l01-gateway"
 		},
 		{
+			"name": "embedded-pbstreams",
+			"path": "../embedded-pbstreams"
+		},
+		{
+			"name": "embedded-nrf24l01",
 			"path": "../embedded-nrf24l01"
 		},
 		{
+			"name": "rust-exercises",
 			"path": "../../ferrous-systems/rust-exercises"
 		},
 		{
+			"name": "radio-app",
 			"path": "../../ferrous-systems/rust-exercises/nrf52-code/radio-app"
 		},
 		{
+			"name": "nrf-hal",
 			"path": "../nrf-hal"
 		}
 	],

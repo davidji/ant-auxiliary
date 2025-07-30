@@ -6,7 +6,7 @@ use crate::{
         Response, 
         Response_::Peripheral as ResponsePeripheral,
     },
-    codec::{ ResponseSender},
+    shell::{ ResponseSender },
 };
 
 use defmt::{ info, warn };
